@@ -32,25 +32,40 @@ def rrf(ranked_lists: Sequence[Sequence[str]], k: int = 60) -> dict[str, float]:
 
 _WS = re.compile(r"\s+")
 
+# How much of a chunk's end is compared with its neighbour to detect the chunker's overlap.
+OVERLAP_PROBE_CHARS = 120
+
 
 def _normalize(text: str) -> str:
     return _WS.sub(" ", text).strip().lower()
 
 
+def _overlaps(a: str, b: str) -> bool:
+    """True when the last OVERLAP_PROBE_CHARS normalized characters of one text appear in the other."""
+    if not a or not b:
+        return False
+    return a[-OVERLAP_PROBE_CHARS:] in b or b[-OVERLAP_PROBE_CHARS:] in a
+
+
 def drop_near_duplicates(hits: list[Hit]) -> list[Hit]:
-    """Drop a hit whose normalized text was already kept, or whose chunk is adjacent
-    (ordinal plus or minus one) to a kept chunk of the same document."""
+    """Drop a hit whose normalized text was already kept, or whose chunk is adjacent (ordinal plus or
+    minus one) to a kept chunk of the same document AND repeats its text (the chunker's overlap).
+
+    An adjacent chunk with its own text is kept: with structure-aware chunks a neighbour is usually a
+    different section (the steps after the overview), not a copy.
+    """
     kept: list[Hit] = []
     seen_text: set[str] = set()
-    seen_pos: set[tuple[str, int]] = set()
+    kept_at: dict[tuple[str, int], str] = {}
     for hit in hits:
         c = hit.chunk
         norm = _normalize(c.text)
         if norm in seen_text:
             continue
-        if (c.doc_id, c.ordinal - 1) in seen_pos or (c.doc_id, c.ordinal + 1) in seen_pos:
+        neighbours = (kept_at.get((c.doc_id, c.ordinal - 1)), kept_at.get((c.doc_id, c.ordinal + 1)))
+        if any(other is not None and _overlaps(norm, other) for other in neighbours):
             continue
         kept.append(hit)
         seen_text.add(norm)
-        seen_pos.add((c.doc_id, c.ordinal))
+        kept_at[(c.doc_id, c.ordinal)] = norm
     return kept

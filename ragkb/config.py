@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     UI_ENABLED: bool = True
     MCP_ENABLED: bool = True
     MCP_PUBLIC: bool = False
+    API_PUBLIC: bool = False
     LOG_LEVEL: str = "INFO"
 
     # retrieval
