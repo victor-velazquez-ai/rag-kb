@@ -1,0 +1,41 @@
+IT Security Policy
+
+Policy reference SEC-02. Owner: IT Security. Effective 15 February 2026. This policy applies to every employee, contractor and intern at Fernhollow Instruments who uses a company device, account or network.
+
+Passwords and sign-in
+
+Passwords for company accounts must be at least 14 characters long. Use a passphrase of several unrelated words rather than a short complex password. Never reuse a company password on another site. Store passwords only in the company password manager, which IT installs on every laptop.
+
+Multi-factor authentication (MFA) is required on email, the HR portal, the finance portal, source code hosting and the VPN. Use the authenticator app on your company phone; text message codes are not accepted.
+
+Devices
+
+Laptops lock automatically after 5 minutes without activity, and you must lock your screen whenever you leave your desk. Full-disk encryption is enabled on every company laptop and must not be turned off.
+
+USB storage devices are blocked on company laptops. To share large files with a customer, use the approved file transfer service instead.
+
+If a company laptop or phone is lost or stolen, report it to the IT Service Desk within 1 hour, by phone on extension 4357 or at servicedesk@fernhollow.example. IT will lock and wipe the device remotely.
+
+Networks
+
+Connect to the company VPN whenever you work on public or hotel Wi-Fi. Guest Wi-Fi in the offices is for visitors only and must not be used by company laptops.
+
+Data classification
+
+Every document and dataset belongs to one of four classes:
+- Public: approved for anyone, such as the website and product brochures.
+- Internal: for employees only, such as this policy and the handbook.
+- Confidential: for named teams only, such as customer contracts and salary data.
+- Restricted: the most sensitive data, such as source code signing keys and security incident reports. Restricted data may only be stored in the encrypted vault.
+
+Patching
+
+Operating system and application updates must be installed within 14 days of release. Critical security updates must be installed within 72 hours. Devices that are more than 30 days behind on updates lose access to the VPN until they are updated.
+
+Phishing and incidents
+
+Report suspicious emails with the Report Phishing button in the mail client or by forwarding them to security@fernhollow.example. Never enter your password on a page you reached from an email link. Suspected security incidents must be reported to IT Security immediately; the on-call security engineer responds within 30 minutes, day or night.
+
+Exceptions
+
+Exceptions to this policy need written approval from the Head of IT Security and are reviewed every 6 months.
