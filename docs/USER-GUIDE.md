@@ -60,6 +60,8 @@ ragkb serve --open
 
 This starts rag-kb at **http://127.0.0.1:8765** and opens your browser. Leave the terminal open; Ctrl+C stops the server. `--port 9000` picks another port.
 
+The page follows your system's light or dark setting; the **Theme** switch at the foot of the sidebar picks **System**, **Light** or **Dark**, and this browser remembers the choice.
+
 Start rag-kb from the same folder each time (or set `RAGKB_DATA_DIR` to an absolute path, see section 9): the data folder is `./data` relative to where you start it.
 
 ## 5. Create a collection and upload

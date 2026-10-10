@@ -104,3 +104,52 @@ def test_ui_files_have_no_long_dashes():
     for name in ("index.html", "app.js", "styles.css"):
         text = (UI_DIR / name).read_text(encoding="utf-8")
         assert "\u2014" not in text and "\u2013" not in text, name
+
+
+def _custom_properties(block: str) -> dict[str, str]:
+    return dict(re.findall(r"--([\w-]+)\s*:\s*([^;]+);", block))
+
+
+def _rule_body(css: str, selector_pattern: str) -> str:
+    match = re.search(selector_pattern + r"\s*\{([^{}]*)\}", css)
+    assert match is not None, selector_pattern
+    return match.group(1)
+
+
+def test_theme_switch_is_in_the_page():
+    html = (UI_DIR / "index.html").read_text(encoding="utf-8")
+    switch = re.search(r'<fieldset class="theme-switch">(.*?)</fieldset>', html, flags=re.DOTALL)
+    assert switch is not None, "the sidebar has a theme switch"
+    assert re.search(r"<legend[^>]*>Theme</legend>", switch.group(1))
+    for value, label in (("system", "System"), ("light", "Light"), ("dark", "Dark")):
+        assert re.search(rf'<input type="radio" name="theme" id="theme-{value}" value="{value}"', switch.group(1))
+        assert re.search(rf'<label for="theme-{value}"[^>]*>{label}</label>', switch.group(1))
+    # The theme is applied before the first paint, so the script that does it must not be deferred.
+    head = html.split("</head>", 1)[0]
+    script = re.search(r'<script src="/ui/app\.js"([^>]*)>', head)
+    assert script is not None and "defer" not in script.group(1) and "async" not in script.group(1)
+
+    js = (UI_DIR / "app.js").read_text(encoding="utf-8")
+    assert "recall('theme'" in js and "store('theme'" in js
+    assert "setAttribute('data-theme'" in js and "removeAttribute('data-theme')" in js
+
+
+def test_css_defines_light_system_dark_and_forced_dark():
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    light = _custom_properties(_rule_body(css, r"(?m)^:root"))
+    assert re.search(r':root\[data-theme="light"\]\s*\{[^}]*color-scheme:\s*light', css)
+    media = re.search(r"@media \(prefers-color-scheme: dark\)\s*\{\s*:root:not\(\[data-theme=\"light\"\]\)\s*\{([^{}]*)\}",
+                      css)
+    assert media is not None, "the system dark theme must step aside when Light is picked"
+    system_dark = _custom_properties(media.group(1))
+    forced_dark = _custom_properties(_rule_body(css, r':root\[data-theme="dark"\]'))
+    assert system_dark and system_dark == forced_dark, "the two dark sets must stay identical"
+    assert set(system_dark) <= set(light), "every dark colour needs a light counterpart"
+
+
+def test_css_colours_live_only_in_the_theme_variables():
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    for body in re.findall(r"\{([^{}]*)\}", css):
+        body = re.sub(r"--[\w-]+\s*:[^;]+;", "", body)
+        assert not re.search(r"#[0-9a-fA-F]{3,8}\b|\b(rgba?|hsla?)\(|:\s*(white|black)\b", body), body.strip()

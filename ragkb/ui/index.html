@@ -6,8 +6,9 @@
   <meta name="color-scheme" content="light dark">
   <title>rag-kb</title>
   <link rel="icon" href="data:,">
+  <!-- Not deferred: app.js applies the saved theme before the first paint, then waits for the page to start. -->
+  <script src="/ui/app.js"></script>
   <link rel="stylesheet" href="/ui/styles.css">
-  <script src="/ui/app.js" defer></script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -39,6 +40,20 @@
       <button type="submit" class="btn btn-primary btn-block">Create collection</button>
       <p id="collection-form-error" class="field-error" role="alert" hidden></p>
     </form>
+
+    <div class="side-footer">
+      <fieldset class="theme-switch">
+        <legend class="side-title">Theme</legend>
+        <div id="theme-switch" class="segmented">
+          <input type="radio" name="theme" id="theme-system" value="system" autocomplete="off" checked>
+          <label for="theme-system" title="Follow the light or dark setting of the operating system">System</label>
+          <input type="radio" name="theme" id="theme-light" value="light" autocomplete="off">
+          <label for="theme-light">Light</label>
+          <input type="radio" name="theme" id="theme-dark" value="dark" autocomplete="off">
+          <label for="theme-dark">Dark</label>
+        </div>
+      </fieldset>
+    </div>
   </aside>
 
   <main id="main" class="main" tabindex="-1">

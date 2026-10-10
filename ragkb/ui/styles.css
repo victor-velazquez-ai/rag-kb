@@ -1,5 +1,7 @@
-/* rag-kb UI. Plain CSS, system fonts, light and dark themes from the operating system. */
+/* rag-kb UI. Plain CSS, system fonts. Light and dark themes: the operating system's by default, or the one
+ * picked with the Theme switch, which sets data-theme="light" or data-theme="dark" on <html>. */
 
+/* Light: the defaults. */
 :root {
   color-scheme: light dark;
   --bg: #f5f6f8;
@@ -7,18 +9,20 @@
   --surface-2: #f0f2f5;
   --border: #dde1e7;
   --border-strong: #c5ccd6;
+  --field-border: #858f9e;
   --text: #1a1e24;
   --muted: #5d6877;
   --accent: #3653d4;
   --accent-hover: #2a43b3;
   --accent-contrast: #ffffff;
   --accent-soft: #e8ecff;
-  --ok: #1d7f47;
+  --ok: #197542;
   --ok-soft: #e2f4e9;
   --warn: #965a00;
   --warn-soft: #fff2db;
   --err: #b42525;
   --err-soft: #fdeaea;
+  --err-contrast: #ffffff;
   --info: #1c64c2;
   --info-soft: #e4effc;
   --flash: #fff4c2;
@@ -30,13 +34,18 @@
   --focus: 0 0 0 3px rgba(54, 83, 212, 0.35);
 }
 
+:root[data-theme="light"] { color-scheme: light; }
+
+/* Dark, twice: from the operating system unless Light is picked, and when Dark is picked.
+ * Keep the two sets identical (a test compares them). */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --bg: #0f1216;
     --surface: #161a20;
     --surface-2: #1d222a;
     --border: #2a313b;
     --border-strong: #3a4350;
+    --field-border: #5d6878;
     --text: #e5e8ed;
     --muted: #98a3b3;
     --accent: #7d95ff;
@@ -49,12 +58,41 @@
     --warn-soft: #33260c;
     --err: #ff8080;
     --err-soft: #3a1919;
+    --err-contrast: #0f1216;
     --info: #6eaaff;
     --info-soft: #152842;
     --flash: #3b3410;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
     --focus: 0 0 0 3px rgba(125, 149, 255, 0.45);
   }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f1216;
+  --surface: #161a20;
+  --surface-2: #1d222a;
+  --border: #2a313b;
+  --border-strong: #3a4350;
+  --field-border: #5d6878;
+  --text: #e5e8ed;
+  --muted: #98a3b3;
+  --accent: #7d95ff;
+  --accent-hover: #9aadff;
+  --accent-contrast: #0f1216;
+  --accent-soft: #222a44;
+  --ok: #52c487;
+  --ok-soft: #143021;
+  --warn: #f0a83e;
+  --warn-soft: #33260c;
+  --err: #ff8080;
+  --err-soft: #3a1919;
+  --err-contrast: #0f1216;
+  --info: #6eaaff;
+  --info-soft: #152842;
+  --flash: #3b3410;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --focus: 0 0 0 3px rgba(125, 149, 255, 0.45);
 }
 
 * { box-sizing: border-box; }
@@ -182,11 +220,29 @@ a { color: var(--accent); }
 .collection-form input { width: 100%; }
 .field-error { color: var(--err); font-size: 0.85rem; margin: 0; }
 
+/* Theme switch: three radios drawn as a segmented control, at the foot of the sidebar. */
+.side-footer { margin-top: auto; padding-top: 14px; border-top: 1px solid var(--border); }
+.theme-switch { border: 0; margin: 0; padding: 0; min-width: 0; }
+.theme-switch legend { padding: 0; margin-bottom: 8px; }
+.segmented {
+  position: relative; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 2px;
+  border: 1px solid var(--border-strong); border-radius: var(--radius-small); background: var(--surface-2);
+}
+.segmented input { position: absolute; opacity: 0; width: 1px; height: 1px; margin: 0; pointer-events: none; }
+.segmented label {
+  text-align: center; font-size: 0.82rem; font-weight: 600; padding: 4px 6px; border-radius: 4px;
+  color: var(--muted); cursor: pointer; user-select: none;
+}
+.segmented label:hover { color: var(--text); }
+.segmented input:checked + label { background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.segmented input:focus-visible + label { box-shadow: var(--focus); }
+.segmented input:checked:focus-visible + label { box-shadow: inset 0 0 0 1px var(--accent), var(--focus); }
+
 /* ---------------------------------------------------------------- controls */
 
 input, select, textarea {
   font: inherit; color: var(--text); background: var(--surface);
-  border: 1px solid var(--border-strong); border-radius: var(--radius-small); padding: 7px 10px;
+  border: 1px solid var(--field-border); border-radius: var(--radius-small); padding: 7px 10px;
 }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: var(--focus); }
 textarea { resize: vertical; width: 100%; min-height: 84px; line-height: 1.45; }
@@ -206,7 +262,7 @@ input[type="number"] { width: 5.5em; }
 .btn-ghost:hover { background: var(--accent-soft); }
 .btn-danger-ghost { background: transparent; border-color: transparent; color: var(--err); }
 .btn-danger-ghost:hover { background: var(--err-soft); }
-.btn.armed { background: var(--err); border-color: var(--err); color: #fff; }
+.btn.armed { background: var(--err); border-color: var(--err); color: var(--err-contrast); }
 .btn-small { padding: 4px 9px; font-size: 0.82rem; }
 .btn-block { width: 100%; }
 .btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }

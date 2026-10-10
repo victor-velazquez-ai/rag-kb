@@ -2,6 +2,9 @@
  *
  * Every string from the server or the user is rendered as text (textContent). The only HTML built from
  * strings is the answer's markdown, which is escaped first and then formatted by a small renderer.
+ *
+ * Loaded synchronously in <head> (not deferred): the saved theme is applied while the script runs, before the
+ * first paint, and everything else waits for DOMContentLoaded.
  */
 (() => {
   'use strict';
@@ -97,6 +100,33 @@
       return value === null ? fallback : value;
     } catch (e) {
       return fallback;
+    }
+  }
+
+  // ------------------------------------------------------------------ theme
+
+  const THEMES = ['system', 'light', 'dark'];
+
+  // System removes the attribute so the stylesheet follows prefers-color-scheme.
+  function applyTheme(choice) {
+    const root = document.documentElement;
+    if (choice === 'light' || choice === 'dark') root.setAttribute('data-theme', choice);
+    else root.removeAttribute('data-theme');
+  }
+
+  // Runs as the script loads, before the first paint, so a saved theme never flashes the other one.
+  applyTheme(recall('theme', 'system'));
+
+  function setupTheme() {
+    const saved = recall('theme', 'system');
+    const current = THEMES.includes(saved) ? saved : 'system';
+    for (const input of document.querySelectorAll('#theme-switch input[name="theme"]')) {
+      input.checked = input.value === current;
+      input.addEventListener('change', () => {
+        if (!input.checked) return;
+        applyTheme(input.value);
+        store('theme', input.value);
+      });
     }
   }
 
@@ -1716,6 +1746,7 @@
   // ------------------------------------------------------------------ start
 
   async function start() {
+    setupTheme();
     setupTabs();
     setupCollectionForm();
     setupUploads();
