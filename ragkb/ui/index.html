@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>rag-kb</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/ui/styles.css">
+  <script src="/ui/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<div id="sr-status" class="sr-only" role="status" aria-live="polite"></div>
+
+<div class="app">
+  <aside class="sidebar" aria-label="Collections and status">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">kb</span>
+      <span class="brand-name">rag-kb</span>
+    </div>
+
+    <div class="badges">
+      <span id="health-badge" class="badge badge-muted" title="Server health">Checking</span>
+      <span id="provider-badge" class="badge badge-muted" title="Who writes the answers">Provider</span>
+    </div>
+
+    <nav class="side-section" aria-labelledby="collections-heading">
+      <h2 id="collections-heading" class="side-title">Collections</h2>
+      <ul id="collection-list" class="collection-list"></ul>
+      <p id="collection-empty" class="muted small" hidden>No collections yet. Create one below.</p>
+    </nav>
+
+    <form id="collection-form" class="side-section collection-form" autocomplete="off" novalidate>
+      <label for="collection-name" class="side-title">New collection</label>
+      <input id="collection-name" name="name" maxlength="100" placeholder="Name, for example Handbook" required>
+      <input id="collection-desc" name="description" maxlength="1000" placeholder="Description (optional)"
+             aria-label="Description (optional)">
+      <button type="submit" class="btn btn-primary btn-block">Create collection</button>
+      <p id="collection-form-error" class="field-error" role="alert" hidden></p>
+    </form>
+  </aside>
+
+  <main id="main" class="main" tabindex="-1">
+    <div id="banner" class="banner" role="alert" hidden></div>
+
+    <header class="main-header">
+      <div class="main-header-text">
+        <h1 id="collection-title">Knowledge base</h1>
+        <p id="collection-meta" class="muted small"></p>
+      </div>
+      <button id="collection-delete" class="btn btn-danger-ghost" type="button" hidden>Delete collection</button>
+    </header>
+
+    <div class="tabs" role="tablist" aria-label="Sections">
+      <button class="tab" type="button" role="tab" id="tab-documents" aria-controls="panel-documents" aria-selected="true">Documents</button>
+      <button class="tab" type="button" role="tab" id="tab-ask" aria-controls="panel-ask" aria-selected="false" tabindex="-1">Ask</button>
+      <button class="tab" type="button" role="tab" id="tab-settings" aria-controls="panel-settings" aria-selected="false" tabindex="-1">Settings</button>
+      <button class="tab" type="button" role="tab" id="tab-connect" aria-controls="panel-connect" aria-selected="false" tabindex="-1">Connect</button>
+      <button class="tab" type="button" role="tab" id="tab-help" aria-controls="panel-help" aria-selected="false" tabindex="-1">Help</button>
+    </div>
+
+    <!-- Documents -->
+    <section id="panel-documents" class="panel" role="tabpanel" aria-labelledby="tab-documents" tabindex="0">
+      <div id="docs-no-collection" class="empty-state" hidden>
+        <h2>Start with a collection</h2>
+        <p>A collection holds one corpus: a team's handbook, a product's manuals, a client's contracts.
+          Create one in the sidebar, then drop your documents here.</p>
+      </div>
+
+      <div id="docs-body">
+        <div class="upload-row">
+          <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-describedby="dropzone-hint">
+            <span class="dropzone-icon" aria-hidden="true"></span>
+            <span><strong>Drop files here</strong> or <span class="link-like">choose files</span></span>
+            <span id="dropzone-hint" class="muted small">PDF, Word, Markdown, text, HTML, CSV and Excel</span>
+          </div>
+          <input id="file-input" type="file" multiple hidden>
+          <div class="title-field">
+            <label for="upload-title">Title <span class="muted">(one file only, optional)</span></label>
+            <input id="upload-title" maxlength="300" placeholder="Taken from the document when empty">
+            <p class="muted small">Uploading a document with an existing title replaces that document.
+              The same content twice is detected and kept once.</p>
+          </div>
+        </div>
+
+        <div id="upload-panel" class="upload-panel" hidden>
+          <div class="upload-panel-head">
+            <h2 class="h3">Uploads</h2>
+            <button id="uploads-clear" class="btn btn-ghost btn-small" type="button">Clear finished</button>
+          </div>
+          <ul id="upload-list" class="upload-list" aria-live="polite"></ul>
+        </div>
+
+        <div class="table-wrap">
+          <table class="docs-table">
+            <caption class="sr-only">Documents in this collection</caption>
+            <thead>
+              <tr>
+                <th scope="col">Status</th>
+                <th scope="col">Title</th>
+                <th scope="col">Type</th>
+                <th scope="col" class="num">Pages</th>
+                <th scope="col" class="num">Chunks</th>
+                <th scope="col" class="num">Size</th>
+                <th scope="col">Uploaded</th>
+                <th scope="col">Indexed</th>
+                <th scope="col"><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="docs-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- Ask -->
+    <section id="panel-ask" class="panel" role="tabpanel" aria-labelledby="tab-ask" tabindex="0" hidden>
+      <div id="ask-no-collection" class="empty-state" hidden>
+        <h2>Pick a collection first</h2>
+        <p>Questions are answered from one collection at a time. Create or select one in the sidebar.</p>
+      </div>
+
+      <form id="ask-form" class="ask-form" novalidate>
+        <label for="question" class="sr-only">Question</label>
+        <textarea id="question" rows="3" maxlength="4000"
+                  placeholder="Ask a question about the documents in this collection"></textarea>
+        <div class="ask-controls">
+          <label class="control">
+            <span class="control-label">Provider</span>
+            <select id="provider-select"></select>
+          </label>
+          <label class="control" id="model-field" hidden>
+            <span class="control-label">Model</span>
+            <select id="model-select"></select>
+          </label>
+          <label class="control control-narrow">
+            <span class="control-label">Passages</span>
+            <input id="topk-input" type="number" min="1" max="20" value="6" inputmode="numeric">
+          </label>
+          <button type="submit" class="btn btn-primary" id="ask-button">Ask</button>
+        </div>
+        <p class="muted small">Enter sends, Shift+Enter starts a new line. Press / anywhere to come back here.</p>
+        <div id="provider-notes" class="provider-notes"></div>
+        <div id="suggestions" class="suggestions" aria-label="Suggested questions"></div>
+      </form>
+
+      <div id="answer-area" class="answer-area" aria-live="polite"></div>
+    </section>
+
+    <!-- Settings -->
+    <section id="panel-settings" class="panel" role="tabpanel" aria-labelledby="tab-settings" tabindex="0" hidden>
+      <div class="panel-head">
+        <h2>Settings and health</h2>
+        <button id="settings-refresh" class="btn btn-ghost btn-small" type="button">Check again</button>
+      </div>
+      <p class="muted small">Settings come from <code>RAGKB_*</code> environment variables or a <code>.env</code>
+        file next to where you start the server. Change them there and restart.</p>
+      <div id="settings-body" class="settings-grid"></div>
+    </section>
+
+    <!-- Connect -->
+    <section id="panel-connect" class="panel" role="tabpanel" aria-labelledby="tab-connect" tabindex="0" hidden>
+      <div class="panel-head">
+        <h2>Connect your assistant</h2>
+      </div>
+      <p>Your own assistant can use this knowledge base as a tool through MCP. It searches and reads the
+        brief here, then writes the answer on your own subscription.</p>
+      <div id="connect-body"></div>
+    </section>
+
+    <!-- Help -->
+    <section id="panel-help" class="panel prose" role="tabpanel" aria-labelledby="tab-help" tabindex="0" hidden>
+      <h2>How answers are produced</h2>
+      <ol>
+        <li><strong>Search.</strong> Your question is matched against every passage in the collection twice: by
+          meaning (vector search on local embeddings) and by words (full-text search). The two ranked lists are
+          fused, near-duplicates are dropped, and the best passages are kept (the Passages setting on the Ask tab).</li>
+        <li><strong>Compose.</strong> The kept passages are numbered and sent, with your question, to the provider
+          you chose. It is told to answer only from those passages, in the language of your question, direct
+          answer first, citing each sentence with a number like [2].</li>
+        <li><strong>Check.</strong> Citations are renumbered 1, 2, 3 in order of use and mapped to the sources
+          list. When the passages do not answer the question, the provider replies with a fixed signal and you
+          see a "Not covered" state instead of a guess.</li>
+      </ol>
+
+      <h2>Providers</h2>
+      <ul>
+        <li><strong>Claude Code</strong> runs on your Claude Pro or Max plan. Sign in once with
+          <code>claude</code> and then <code>/login</code>.</li>
+        <li><strong>Codex</strong> runs on your ChatGPT Plus or Pro plan. Sign in once with <code>codex login</code>.</li>
+        <li><strong>Extractive mode</strong> uses no AI: it lists the best sentences from the top passages with
+          their citations. It always works, also with no subscription.</li>
+      </ul>
+      <p>Auto picks Claude Code when it is signed in, then Codex, then extractive mode.</p>
+
+      <h2>How to read the scores</h2>
+      <ul>
+        <li>Each source shows a <strong>score</strong> and a bar. The score comes from rank fusion: a passage
+          that ranks high in both the meaning search and the word search scores highest. It is a ranking signal,
+          not a probability and not a measure of truth.</li>
+        <li>The bar is <strong>relative to the strongest source</strong> in the same answer, so a full bar means
+          "the best match here", not "a perfect match".</li>
+        <li>Low scores across the board usually mean the collection does not cover the question well. Open the
+          passage to check what was actually said.</li>
+      </ul>
+
+      <h2>What the states mean</h2>
+      <p>Open a state to see exactly how it looks on the Ask tab.</p>
+      <div id="help-states" class="help-states"></div>
+
+      <h2>Keyboard</h2>
+      <ul>
+        <li><kbd>/</kbd> jumps to the question box. <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd> adds a line.</li>
+        <li>On the tab bar, <kbd>Left</kbd> and <kbd>Right</kbd> move between tabs, <kbd>Home</kbd> and <kbd>End</kbd> jump to the ends.</li>
+        <li>The drop zone opens the file picker with <kbd>Enter</kbd> or <kbd>Space</kbd>.</li>
+        <li>Delete buttons need a second click within 4 seconds.</li>
+      </ul>
+
+      <h2>Privacy</h2>
+      <p>Documents, embeddings and the index stay in the data folder on this machine. Only the passages chosen for
+        an answer leave it, inside the prompt sent to the provider you picked, which is the same as pasting them into
+        that assistant yourself. The audit log keeps who answered, how long it took and the outcome, never the
+        passages or the answer text.</p>
+    </section>
+  </main>
+
+  <footer class="statusbar" aria-label="Status">
+    <span class="status-item">Knowledge <strong id="status-version">unknown</strong></span>
+    <span class="status-item status-data">Data <code id="status-data">unknown</code></span>
+    <span class="status-item">rag-kb <span id="status-app-version"></span></span>
+    <span class="status-item" id="status-checked"></span>
+  </footer>
+</div>
+</body>
+</html>
