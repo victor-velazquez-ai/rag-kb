@@ -72,10 +72,12 @@ docs/
 | `CODEX_REASONING` | `medium` | passed as `-c model_reasoning_effort=...` |
 | `ANSWER_TIMEOUT_S` | `180` | provider call timeout |
 | `MCP_ENABLED` | `true` | mount `/mcp` |
+| `MCP_PUBLIC` | `false` | `/mcp` answers any `Host`, not only loopback |
+| `API_PUBLIC` | `false` | `/api` answers any `Host`, not only loopback (`GET /api/health` always answers) |
 | `UI_ENABLED` | `true` | mount the UI at `/` |
 | `LOG_LEVEL` | `INFO` | |
 
-A test asserts that every setting read in code appears in `.env.example` and the reverse.
+A test (`tests/test_config_documented.py`) asserts that every setting, and every `RAGKB_` variable the code reads from the environment (the test-only `RAGKB_FAKE_EMBEDDER`), appears in `.env.example` with its default, and the reverse.
 
 ## 3. Data model (`ragkb/models.py`)
 
@@ -155,7 +157,7 @@ class Reranker(Protocol):
     def rerank(self, query: str, hits: list[Hit], top_n: int) -> list[Hit]: ...   # falls back to the input order on any error
 
 def rrf(ranked_lists: Sequence[Sequence[str]], k: int = 60) -> dict[str, float]
-def drop_near_duplicates(hits: list[Hit]) -> list[Hit]   # same normalized text, or adjacent ordinal of the same doc
+def drop_near_duplicates(hits: list[Hit]) -> list[Hit]   # same normalized text, or an adjacent ordinal of the same doc whose text overlaps (one text's last 120 normalized characters appear in the other)
 
 # store/base.py
 class VectorStore(Protocol):
@@ -197,6 +199,7 @@ System prompt (the generic persona is "a careful knowledge-base assistant"):
 - Start with the direct answer in one or two sentences. Then give the useful details in short paragraphs or bullets. Use headings only for long answers.
 - Cite inline with the passage number in square brackets, like [2], right after the sentence it supports. Do not write a sources list; the app does that.
 - If the passages answer only part of the question, say which part is not covered in one final short paragraph.
+- Never infer that something is absent or present because the passages do not mention it: say that the documents do not mention it, and stop.
 - Do not say "based on the context" or similar.
 - If the passages do not answer the question at all, reply with exactly `NO_ANSWER` and nothing else.
 
@@ -206,7 +209,7 @@ Composition rules:
 - `status`: `answered` when the model produced text; `no_answer` on the sentinel; `no_documents` when the collection has no indexed documents (checked after an empty or declined result); `provider_unavailable` or `rate_limited` from provider errors; `retrieval_unavailable` when search fails.
 - `message` texts: "The knowledge base does not cover this question." / "This collection has no documents yet. Upload some to get started." / "{provider} is not signed in. Run: {fix_command}" / "Search is unavailable right now."
 - Citations: find `[n]` markers in the text, map to kept passages, renumber densely 1..K in order of first appearance, rewrite the text in one pass, dedupe by chunk. Unknown markers are left alone and logged. Snippet: the first 240 characters of the chunk's display text.
-- Extractive provider: no model call. It returns a digest: a lead line ("Here is what the documents say about ...") then one bullet per source with the best sentences and a [n] marker, then the same citations. Its status is `answered` only when the top fused score is above a small threshold; otherwise `no_answer`.
+- Extractive provider: no model call. It returns a digest: a lead line ("Here is what the documents say about ...") then one bullet per source with the best sentences and a [n] marker, then the same citations. Its status is `answered` only when the top fused score is above a small threshold and the passages are about the question: each topic word of the question is weighted by its rarity across the retrieved passages (IDF), a word no passage contains is tolerated only once per five topic words, the passages together hold at least 60% of the question's weight and one passage alone at least 50%; otherwise `no_answer`. Its sentences are ranked by the same weights.
 
 ## 6. Provider adapters
 
@@ -251,6 +254,8 @@ Registry (`providers/registry.py`): `available()` returns statuses; `select(name
 | `POST /api/answers/{aid}/feedback` | `{rating, note}` |
 | `GET /mcp` and `POST /mcp` | MCP streamable HTTP |
 | `GET /` | the UI |
+
+Loopback only unless `RAGKB_API_PUBLIC=true`: a request whose `Host` is not loopback gets 403 `forbidden`, except `GET /api/health`.
 
 Error envelope: `{"error": {"code": "...", "message": "..."}}` with codes such as `not_found`, `unsupported_file_type`, `file_too_large`, `empty_document`, `invalid_request`, `provider_unavailable`, `rate_limited`. Messages are plain sentences and never include paths or stack traces.
 

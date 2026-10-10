@@ -5,7 +5,7 @@ rag-kb is a fresh implementation, but it stands on lessons from building and ope
 ## Keep
 
 1. **Honesty is a contract, not a prompt.** A model told to "say you don't know" sometimes writes text that reads like an answer. Use an exact sentinel the code can detect, turn it into a status, and render that status distinctly. Every response carries every field, always, so clients never guess.
-2. **Hybrid retrieval with rank fusion.** Vector search finds meaning; full-text search finds names, codes and exact phrases. Fuse the two ranked lists (reciprocal rank fusion) and drop near-duplicates (same text, or the neighbouring chunk of the same document) before composing.
+2. **Hybrid retrieval with rank fusion.** Vector search finds meaning; full-text search finds names, codes and exact phrases. Fuse the two ranked lists (reciprocal rank fusion) and drop near-duplicates (same text, or a neighbouring chunk of the same document that repeats its text) before composing. A neighbour with its own text is usually the next section, not a copy, so it stays.
 3. **Composition is the relevance filter.** A cosine floor could not separate good from bad passages: the score distributions overlapped. Keep the floor at zero by default and let the composition step decide what answers the question.
 4. **Budget once, cite only what was kept.** Select the passages that fit the context budget once; number only those; a dropped passage can never be cited.
 5. **Dense, stable citations.** Renumber markers to 1..K in order of first use and deduplicate by source. Gaps and repeats broke clients before.

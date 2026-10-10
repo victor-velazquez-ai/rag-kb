@@ -1,0 +1,76 @@
+# Golden set for the sample corpus (a fictional instrument maker's internal documents).
+# Run it with `ragkb eval` (offline) or `ragkb eval --live`. Format and scoring: docs/EVALS.md.
+# Every positive names the file that answers it; keywords are facts any correct answer contains.
+# Every document is asked about at least once. The negatives are questions these documents do not
+# answer: two plainly out of scope, two near misses that share words with the corpus.
+corpus_dir: samples/corpus
+collection: sample
+cases:
+  - id: q01
+    question: "How many days of annual leave does a full-time employee get?"
+    expect_sources: ["employee-handbook.md"]
+    expect_keywords: ["27"]
+  - id: q02
+    question: "What notice period applies after probation to someone with four years of service?"
+    expect_sources: ["employee-handbook.md"]
+    expect_keywords: ["3 months"]
+  - id: q03
+    question: "What is the maximum hotel rate per night in a capital city?"
+    expect_sources: ["travel-and-expense-policy.md"]
+    expect_keywords: ["210"]
+  - id: q04
+    question: "Who has to approve an expense claim of EUR 3,000?"
+    expect_sources: ["travel-and-expense-policy.md"]
+    expect_keywords: ["director"]
+  - id: q05
+    question: "How quickly do I have to report a stolen company laptop?"
+    expect_sources: ["it-security-policy.txt"]
+    expect_keywords: ["1 hour"]
+  - id: q06
+    question: "How long does the FH-200 battery last on the standard sampling interval?"
+    expect_sources: ["fh-200-product-faq.md"]
+    expect_keywords: ["18 months"]
+  - id: q07
+    question: "How do I reset the FH-200 to factory settings?"
+    expect_sources: ["fh-200-product-faq.md"]
+    expect_keywords: ["10 seconds"]
+  - id: q08
+    question: "How long does a customer have to ship a return before the RMA number expires?"
+    expect_sources: ["customer-return-procedure.md"]
+    expect_keywords: ["14 days"]
+  - id: q09
+    question: "Do the company shutdown days at the end of December count against my annual leave?"
+    expect_sources: ["office-holidays-2026.csv"]
+    note: "the handbook also talks about annual leave; the answer is only in the holiday calendar"
+  - id: q10
+    question: "What time should a new starter arrive at Eastbridge reception on their first day?"
+    expect_sources: ["onboarding-guide.html"]
+    expect_keywords: ["9:00"]
+  - id: q11
+    question: "How long do we keep CCTV footage?"
+    expect_sources: ["data-retention-policy.docx"]
+    expect_keywords: ["30 days"]
+    note: "the answer is a row of a Word table"
+  - id: q12
+    question: "Does the health insurance cover dental treatment?"
+    expect_sources: ["employee-benefits-2026.pdf"]
+    expect_keywords: ["600"]
+  - id: q13
+    question: "How much does the LTE modem kit cost?"
+    expect_sources: ["price-list-2026.xlsx"]
+    expect_keywords: ["89"]
+    note: "the product FAQ names the kit too; the price is only in the spreadsheet"
+  - id: n01
+    question: "What was the company's revenue last year?"
+    expect: empty
+  - id: n02
+    question: "Which football team won the world cup in 2022?"
+    expect: empty
+  - id: n03
+    question: "Is there a dress code for staff at the Port Sallow office?"
+    expect: empty
+    note: "near miss: Port Sallow and office appear in several documents, a dress code in none"
+  - id: n04
+    question: "Can I bring my dog to work?"
+    expect: empty
+    note: "near miss: a workplace question the handbook does not cover"
