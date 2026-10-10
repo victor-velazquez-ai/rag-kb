@@ -136,3 +136,14 @@ When a change to chunking, the embedding model, the reranker or `RAGKB_MIN_SCORE
 8. **Keep it with the corpus under version control** and run it after every change to the pipeline or the documents. Do not tune settings to one small set until it passes; add cases instead.
 
 Same-model judges ("ask a model whether the answer is good") are not part of the gate. They are a smoke signal at best. Retrieval is measured against the golden set, honesty against the negatives, and the answers themselves are best checked by reading a sample.
+
+## Latest results on the sample corpus
+
+Measured on 10 October 2026, 13 positives and 4 negatives, top_k 6.
+
+| Run | Embedder | Provider | recall@1 | recall@5 | MRR | citation rate | false answers | declines | Gate |
+|---|---|---|---|---|---|---|---|---|---|
+| Offline (`ragkb eval`) | fake, deterministic | extractive | 0.92 | 1.00 | 0.92 | 1.00 | 0.00 | 1.00 | PASS |
+| Live (`ragkb eval --live`) | BAAI/bge-small-en-v1.5 | Claude Code, claude-sonnet-5-5 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | PASS |
+
+Live answers took 3 to 14 seconds each on a Max subscription.
