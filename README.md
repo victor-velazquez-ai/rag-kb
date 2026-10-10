@@ -81,6 +81,7 @@ Every command takes `--data-dir`.
 - [docs/CONNECT-YOUR-ASSISTANT.md](docs/CONNECT-YOUR-ASSISTANT.md): Claude Code, Codex, Claude Desktop and claude.ai setup, the MCP tools.
 - [docs/EVALS.md](docs/EVALS.md): the golden-set format, the scorers, reading the report.
 - [docs/MASTER-PLAN.md](docs/MASTER-PLAN.md): vision, how subscriptions power the answers, objectives, stack, phases.
+- [docs/ROADMAP.md](docs/ROADMAP.md): future tasks, starting with bringing any other subscription (Gemini, Copilot, local models) as a provider.
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the contracts every part is built against.
 - [docs/design-heritage.md](docs/design-heritage.md): lessons from earlier knowledge-base work that shaped this design.
 

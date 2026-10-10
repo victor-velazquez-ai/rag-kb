@@ -147,3 +147,5 @@ OCR of scanned PDFs, multi-user auth and roles, cloud storage, scheduled re-craw
 - **Default embedding model**: English-first small model, or multilingual from day one at some cost in speed.
 - **Reranker on by default** once the eval shows the gain.
 - **OCR** for scanned PDFs (objective 2 candidate).
+
+Future tasks beyond this plan, including other subscriptions as providers, are tracked in `docs/ROADMAP.md`.
