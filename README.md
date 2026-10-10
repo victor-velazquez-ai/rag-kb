@@ -9,6 +9,8 @@ An enterprise knowledge base with retrieval-augmented answers. Upload a document
 
 ## Quickstart
 
+Using an AI coding assistant (Claude Code, Codex, Cursor)? Open the cloned folder with it and ask it to set the project up: it reads `CLAUDE.md`, which walks it through the installation, the subscription sign-in and the first run.
+
 You need Python 3.11 or newer.
 
 ```bash
@@ -85,3 +87,7 @@ Every command takes `--data-dir`.
 ## Status
 
 Objective 1 (run it locally, one user, your own subscription) is built. Objective 2 (one web deployment for many users, with sign-in and roles, where each user's claude.ai or ChatGPT connects through MCP) is designed in the master plan and not built yet. Run the tests with `pip install -e ".[dev]"` and `pytest`.
+
+## License
+
+MIT. See `LICENSE`.
