@@ -1,0 +1,1 @@
+The fixture word is “lantern.” [1]
