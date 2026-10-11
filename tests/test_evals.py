@@ -270,3 +270,62 @@ def test_offline_run_over_the_sample_corpus(capsys: pytest.CaptureFixture[str]) 
     not_ok = [(row["id"], row["outcome"]) for row in report["cases"] if row["outcome"] != "ok"]
     assert not not_ok, not_ok
     assert "GATE PASS" in run_mod.format_report(report)
+
+
+def _spy_retriever(run_mod: Any, monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Replace the run's Retriever with a subclass that records how it was built and searched."""
+    service = pytest.importorskip("ragkb.retrieval.service")
+    seen: list[dict[str, Any]] = []
+
+    class SpyRetriever(service.Retriever):
+        def search(self, collection_id: str, query: str, top_k: int, *, budget_chars: int | None = None) -> list:
+            seen.append({"reranker": self.reranker, "candidates": self.candidates,
+                         "neighbours": self.neighbour_expansion, "budget": budget_chars})
+            return super().search(collection_id, query, top_k, budget_chars=budget_chars)
+
+    monkeypatch.setattr(run_mod, "Retriever", SpyRetriever)
+    return seen
+
+
+def _small_set(tmp_path: Path) -> Path:
+    path = write_set(tmp_path, VALID)
+    (tmp_path / "corpus" / "handbook.md").write_text(
+        "# Handbook\n\n## Leave\n\nEvery employee gets 27 days of leave per year.\n", encoding="utf-8")
+    return path
+
+
+def test_the_run_builds_and_searches_like_the_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run_mod = pytest.importorskip("ragkb.evals.run")
+    reranker_mod = pytest.importorskip("ragkb.retrieval.reranker")
+    embedder_mod = pytest.importorskip("ragkb.retrieval.embedder")
+    extractive_mod = pytest.importorskip("ragkb.providers.extractive")
+    golden = _small_set(tmp_path)
+    settings = Settings(_env_file=None, RERANKER="local", RERANK_MODEL="fake-cross-encoder", CANDIDATES=12,
+                        NEIGHBOUR_EXPANSION=False, MAX_CONTEXT_CHARS=9000)
+    loaded: list[str] = []
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name: str) -> None:
+            loaded.append(model_name)
+
+        def rerank(self, query: str, documents: list[str]) -> list[float]:
+            return [float(len(d)) for d in documents]
+
+    monkeypatch.setattr(reranker_mod, "TextCrossEncoder", FakeCrossEncoder)
+
+    # Offline: never a reranker (nothing to download), whatever the settings say; the rest follows them.
+    seen = _spy_retriever(run_mod, monkeypatch)
+    report = run_mod.run_eval(golden, settings, live=False)
+    assert report["reranker"] == "none" and "reranker none" in run_mod.format_report(report)
+    assert seen and all(s["reranker"] is None for s in seen) and not loaded
+    assert {(s["candidates"], s["neighbours"], s["budget"]) for s in seen} == {(12, False, 9000)}
+
+    # Live: the reranker RERANKER asks for, with the same candidates, neighbours and budget.
+    monkeypatch.setattr(run_mod, "FastEmbedEmbedder", lambda name: embedder_mod.FakeEmbedder(dims=384))
+    monkeypatch.setattr(run_mod, "_select_live_provider", lambda s: (extractive_mod.ExtractiveProvider(), None))
+    seen = _spy_retriever(run_mod, monkeypatch)
+    report = run_mod.run_eval(golden, settings, live=True)
+    assert report["mode"] == "live" and report["reranker"] == "fake-cross-encoder"
+    assert seen and all(isinstance(s["reranker"], reranker_mod.LocalReranker) for s in seen)
+    assert {(s["candidates"], s["neighbours"], s["budget"]) for s in seen} == {(12, False, 9000)}
+    assert loaded == ["fake-cross-encoder"]

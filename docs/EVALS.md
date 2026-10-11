@@ -5,7 +5,7 @@ The evaluation harness answers two questions with numbers instead of impressions
 1. **Does search find the right document?** For questions the corpus answers, is the document that holds the answer among the top results?
 2. **Does the system stay honest?** For questions the corpus does not answer, does it decline instead of producing something that reads like an answer?
 
-It does this with a **golden set**: a short YAML file of questions, each with the document that should answer it, plus a few questions that must be declined. The harness indexes the corpus into a throwaway data folder, asks every question through the same search and answer path the app uses, scores the results and prints a report. Your real data folder is never touched.
+It does this with a **golden set**: a short YAML file of questions, each with the document that should answer it, plus a few questions that must be declined. The harness indexes the corpus into a throwaway data folder, asks every question through the same search and answer path the app uses (the same candidates, neighbour passages and context budget as an answer in the web app), scores the results and prints a report. Your real data folder is never touched.
 
 ## Running it
 
@@ -18,10 +18,10 @@ ragkb eval --json                            # the raw report as JSON
 
 | Mode | Embeddings | Answers | Cost | What it tells you |
 |---|---|---|---|---|
-| Offline (default) | `FakeEmbedder`: deterministic vectors made from a hash of the text, no model | Extractive provider, no model | Nothing; runs in seconds, same result on every machine | Whether ingestion, keyword search, fusion and the extractive decline rule work. Good for CI. The vector half of search is noise here, so recall comes from keyword matching. |
-| Live (`--live`) | The real model from `RAGKB_EMBED_MODEL` (downloaded on first use) | The provider `RAGKB_PROVIDER` selects (Claude Code, Codex or extractive) | **One answer call per case on your subscription** (about 10 to 30 seconds each) | The real retrieval quality and the real model's honesty. |
+| Offline (default) | `FakeEmbedder`: deterministic vectors made from a hash of the text, no model; no reranker | Extractive provider, no model | Nothing; no download, runs in seconds, same result on every machine | Whether ingestion, keyword search, fusion and the extractive decline rule work. Good for CI. The vector half of search is noise here, so recall comes from keyword matching. |
+| Live (`--live`) | The real model from `RAGKB_EMBED_MODEL` and the reranker from `RAGKB_RERANKER` (downloaded on first use: about 130 MB and 90 MB) | The provider `RAGKB_PROVIDER` selects (Claude Code, Codex or extractive) | **At most one answer call per case on your subscription** (about 10 to 30 seconds each) | The real retrieval quality and the real model's honesty. |
 
-A live run of the sample set (17 cases) makes 17 calls to Claude Code or Codex. On plans with a small Codex quota, run it with `RAGKB_PROVIDER=claude_code` or `RAGKB_PROVIDER=extractive`, or keep the golden set short.
+With the reranker on (the default), a question whose passages the reranker scores weak is declined before any call, so a live run of the sample set (18 cases) makes about 15 calls to Claude Code or Codex. On plans with a small Codex quota, run it with `RAGKB_PROVIDER=claude_code` or `RAGKB_PROVIDER=extractive`, or keep the golden set short.
 
 ## The golden set format
 
@@ -88,37 +88,37 @@ An offline run of the sample golden set, with some rows left out:
 
 ```
 rag-kb eval  samples/golden.yaml
-mode offline: embedder fake-hash-384, provider extractive
-corpus .../samples/corpus: 10 files, 10 ready, 0 failed, 38 passages; knowledge version v20261010.10; top_k 6
+mode offline: embedder fake-hash-384, reranker none, provider extractive
+corpus .../samples/corpus: 10 files, 10 ready, 0 failed, 30 passages; knowledge version v20261011.10; top_k 6
 
 id       kind outcome      status                 rank cites      ms  question
 ------------------------------------------------------------------------------
-q01      pos  ok           answered                  1     4      54  How many days of annual leave does a full-time employee get?
-q08      pos  ok           answered                  2     5      40  How long does a customer have to ship a return before the...
-q11      pos  ok           answered                  1     1      38  How long do we keep CCTV footage?
-q13      pos  ok           answered                  2     5      39  How much does the LTE modem kit cost?
-n01      neg  ok           no_answer                       0      37  What was the company's revenue last year?
-n03      neg  ok           no_answer                       0      35  Is there a dress code for staff at the Port Sallow office?
+q01      pos  ok           answered                  1     2      69  How many days of annual leave does a full-time employee get?
+q08      pos  ok           answered                  2     2      60  How long does a customer have to ship a return before the...
+q11      pos  ok           answered                  1     1      62  How long do we keep CCTV footage?
+q14      pos  ok           answered                  1     1      65  What does FH-MNT-01 cost?
+n01      neg  ok           no_answer                       0      62  What was the company's revenue last year?
+n03      neg  ok           no_answer                       0      62  Is there a dress code for staff at the Port Sallow office?
 ...
 
-recall@1 0.85  recall@3 1.00  recall@5 1.00  recall@6 1.00  MRR 0.92
+recall@1 0.93  recall@3 1.00  recall@5 1.00  recall@6 1.00  MRR 0.96
 answer rate 1.00  citation rate 1.00  keyword rate 1.00
 false-answer rate 0.00  decline rate 1.00
-ran 17 of 17 cases (13 of 13 positives, 4 of 4 negatives); unmeasured 0
-elapsed 1.9 s
+ran 18 of 18 cases (14 of 14 positives, 4 of 4 negatives); unmeasured 0
+elapsed 2.1 s
 
 GATE PASS: recall@5 1.00 >= 0.85 and false-answer rate 0.00 <= 0.05
 ```
 
 A failing case adds a line under its row: `expected ... top results: ...` for a `miss`, `answer lacks: ...` when an expected keyword is missing from the answer, and `not measured: ...` for an unmeasured case.
 
-Row columns: `rank` is where the expected document first appeared (blank when it did not), `cites` is the number of citations, `ms` is the time for search plus answer.
+Row columns: `rank` is where the expected document first appeared among the ranked passages (blank when it did not; a passage attached as context to its neighbour does not count as a rank), `cites` is the number of citations, `ms` is the time for search plus answer.
 
 | Outcome | Meaning | What to look at |
 |---|---|---|
 | `ok` | Positive: expected document in the top 5 and answered. Negative: declined. | Nothing. |
 | `miss` | Positive: the expected document was not in the top 5. | The "top results" line. Is the question worded with terms the document never uses? Is the document's title vague? Did it index (`corpus ... failed`)? Is the fact buried in a long table that got split? |
-| `declined` | Positive: the right document was found but the answer was declined. | Offline: the extractive provider declines when a rare topic word of the question is in no passage, or when no single passage holds half of the question's weight (see `PROVIDERS.md`). Live: the model judged the passages insufficient; read them with `ragkb ask --json`. |
+| `declined` | Positive: the right document was found but the answer was declined. | Offline: the extractive provider declines when a rare topic word of the question is in no passage, or when no single passage holds half of the question's weight (see `PROVIDERS.md`). Live: the reranker scored every passage weak (declined before the call), or the model judged the passages insufficient; read them with `ragkb ask --json`. |
 | `false_answer` | Negative: answered although the corpus does not cover it. | Read the answer. If the corpus really does cover the question, fix the golden set. Otherwise this is the case to fix first. |
 | `unmeasured` | The case could not run. | The "not measured" line: sign in to the provider, wait for a quota reset, or check search health. |
 
@@ -135,15 +135,20 @@ When a change to chunking, the embedding model, the reranker or `RAGKB_MIN_SCORE
 7. **Aim for about three positives per negative,** and at least 20 cases overall for a stable number; 40 to 60 is better for a real corpus. With 16 cases one case moves recall by about 0.08.
 8. **Keep it with the corpus under version control** and run it after every change to the pipeline or the documents. Do not tune settings to one small set until it passes; add cases instead.
 
+**Grow the set from real use.** The Feedback panel on the Settings tab lists the votes on a collection's answers with their questions. Every "Not helpful" vote is a candidate case: open the answer, decide whether the documents do cover the question, and add it as a positive (with the document that answers it) or a negative. For a "not covered" answer, the **Closest passages** under it show what search found, which usually settles which kind of case it is.
+
+**Languages.** The default embedding model is English-first. If your users ask in other languages, include those questions in the golden set, and run the live eval with both `BAAI/bge-small-en-v1.5` and `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (each in its own throwaway run; the harness indexes the corpus from scratch every time) before you switch the real data folder.
+
 Same-model judges ("ask a model whether the answer is good") are not part of the gate. They are a smoke signal at best. Retrieval is measured against the golden set, honesty against the negatives, and the answers themselves are best checked by reading a sample.
 
 ## Latest results on the sample corpus
 
-Measured on 10 October 2026, 13 positives and 4 negatives, top_k 6.
+Measured on 10 October 2026, top_k 6.
 
-| Run | Embedder | Provider | recall@1 | recall@5 | MRR | citation rate | false answers | declines | Gate |
-|---|---|---|---|---|---|---|---|---|---|
-| Offline (`ragkb eval`) | fake, deterministic | extractive | 0.92 | 1.00 | 0.92 | 1.00 | 0.00 | 1.00 | PASS |
-| Live (`ragkb eval --live`) | BAAI/bge-small-en-v1.5 | Claude Code, claude-sonnet-5-5 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | PASS |
+| Run | Cases | Embedder | Reranker | Provider | recall@1 | recall@5 | MRR | citation rate | false answers | declines | Gate |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Offline (`ragkb eval`) | 18 (14 positives, 4 negatives) | fake, deterministic | none | extractive | 0.93 | 1.00 | 0.96 | 1.00 | 0.00 | 1.00 | PASS |
+| Live (`ragkb eval --live`) | 17 (13 positives, 4 negatives), an earlier version of the set | BAAI/bge-small-en-v1.5 | none | Claude Code, claude-sonnet-5-5 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | PASS |
+| Live (`ragkb eval --live`), 10 October, after the QA fixes | BAAI/bge-small-en-v1.5 plus the local reranker | Claude Code, claude-sonnet-5-5 | 1.00 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | PASS |
 
-Live answers took 3 to 14 seconds each on a Max subscription.
+Live answers took 3 to 14 seconds each on a Max subscription; after the QA fixes, 2 to 11 seconds, and the four off-topic questions were declined by the reranker without a model call. The live row predates the reranker default and the eighteenth case; a live run of the current set replaces it.

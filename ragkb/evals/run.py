@@ -4,10 +4,17 @@
 the same retrieval and composition path the app uses, scores the results and returns a report dict.
 It prints nothing; `format_report` turns the report into text for the terminal.
 
-- Offline (`live=False`): the deterministic `FakeEmbedder` and the extractive provider. No model, no
-  network, the same result on every machine; it checks the pipeline and the lexical side of search.
-- Live (`live=True`): the real embedding model from `RAGKB_EMBED_MODEL` and the provider selected by
-  `RAGKB_PROVIDER`, so every question costs one call on the user's subscription.
+The retriever is built the way the app builds it (`Retriever.from_settings`: `CANDIDATES`,
+`NEIGHBOUR_EXPANSION`, `MIN_SCORE`, and the reranker `RERANKER` asks for), and every question is
+searched with the composer's budget (`MAX_CONTEXT_CHARS`), as an answer in the app is.
+
+- Offline (`live=False`): the deterministic `FakeEmbedder`, no reranker, no vector-score floor and the
+  extractive provider. No model, no download, no network, the same result on every machine; it checks
+  the pipeline and the lexical side of search.
+- Live (`live=True`): the real embedding model from `RAGKB_EMBED_MODEL`, the reranker from
+  `RAGKB_RERANKER` and the provider selected by `RAGKB_PROVIDER`, so a question costs at most one call
+  on the user's subscription (none when the reranker finds every passage weak and the answer is
+  declined before the call).
 """
 from __future__ import annotations
 
@@ -35,7 +42,9 @@ from ragkb.models import Citation, Hit
 from ragkb.providers.base import Provider, ProviderError
 from ragkb.providers.extractive import ExtractiveProvider
 from ragkb.providers.registry import ProviderRegistry
+from ragkb.retrieval.base import ranked_only
 from ragkb.retrieval.embedder import FakeEmbedder, FastEmbedEmbedder
+from ragkb.retrieval.reranker import reranker_for
 from ragkb.retrieval.service import RetrievalUnavailable, Retriever
 from ragkb.store.lancedb_store import LanceDBStore
 from ragkb.store.sqlite_meta import SQLiteMeta
@@ -81,9 +90,9 @@ def _close(resource: Any) -> None:
 
 
 class _Run:
-    """One run's state: the throwaway stores, the document names, the results."""
+    """One run's state: the throwaway stores, the retriever, the document names, the results."""
 
-    def __init__(self, settings: Settings, embedder: Any, provider: Any, top_k: int, min_score: float,
+    def __init__(self, settings: Settings, embedder: Any, provider: Any, top_k: int,
                  provider_problem: str | None = None):
         self.settings = settings
         self.provider = provider
@@ -92,7 +101,8 @@ class _Run:
         self.meta = SQLiteMeta(settings.meta_path)
         self.store = LanceDBStore(settings.lancedb_dir, embedder.dims)
         self.pipeline = IngestPipeline(settings, self.meta, self.store, embedder)
-        self.retriever = Retriever(self.store, embedder, reranker=None, min_score=min_score)
+        self.reranker = reranker_for(settings)
+        self.retriever = Retriever.from_settings(self.store, embedder, settings, reranker=self.reranker)
         self.doc_names: dict[str, list[str]] = {}
 
     def close(self) -> None:
@@ -135,7 +145,8 @@ class _Run:
             return result
         started = time.perf_counter()
         try:
-            hits = self.retriever.search(collection_id, case.question, self.top_k)
+            hits = self.retriever.search(collection_id, case.question, self.top_k,
+                                         budget_chars=self.settings.MAX_CONTEXT_CHARS)
         except RetrievalUnavailable:
             result.unmeasured_reason = "search unavailable"
             return result
@@ -161,7 +172,8 @@ class _Run:
         result.status = status
         if status in UNMEASURED_STATUSES:
             result.unmeasured_reason = answer.message or status
-        result.retrieved = [self._names_for_hit(hit) for hit in hits]
+        # Ranks count ranked passages only: a passage attached as context to its neighbour is not a rank.
+        result.retrieved = [self._names_for_hit(hit) for hit in ranked_only(hits)]
         result.cited = [self._names_for_citation(c) for c in answer.citations]
         result.answer_text = answer.answer or ""
         result.model = answer.provider.model if answer.provider else None
@@ -189,7 +201,7 @@ def _case_row(result: CaseResult) -> dict[str, Any]:
 def run_eval(golden_path: Path, settings: Settings, *, live: bool) -> dict[str, Any]:
     """Index the golden set's corpus in a temporary data folder, run every case, return the report.
 
-    Report keys: golden_path, mode, collection, corpus_dir, top_k, embedder, provider, model,
+    Report keys: golden_path, mode, collection, corpus_dir, top_k, embedder, reranker, provider, model,
     knowledge_version, corpus, cases, totals, gate (outcome, exit_code, reasons, thresholds), outcome
     (the gate outcome again, PASS, FAIL or SKIPPED), started_at, elapsed_ms. Prints nothing.
     """
@@ -200,17 +212,18 @@ def run_eval(golden_path: Path, settings: Settings, *, live: bool) -> dict[str, 
 
     with tempfile.TemporaryDirectory(prefix="ragkb-eval-", ignore_cleanup_errors=True) as tmp:
         run_settings = settings.model_copy(update={"DATA_DIR": Path(tmp)})
-        run_settings.ensure_dirs()
         provider_problem: str | None = None
         if live:
             embedder: Any = FastEmbedEmbedder(settings.EMBED_MODEL)
             provider, provider_problem = _select_live_provider(run_settings)
-            min_score = settings.MIN_SCORE
         else:
+            # Deterministic: no reranker model (nothing to download) and no floor on the fake cosines.
+            run_settings = run_settings.model_copy(update={"RERANKER": "none", "MIN_SCORE": 0.0})
             embedder = FakeEmbedder(dims=OFFLINE_DIMS)
             provider = ExtractiveProvider()
-            min_score = 0.0
-        run = _Run(run_settings, embedder, provider, top_k, min_score, provider_problem)
+        run_settings.ensure_dirs()
+        run = _Run(run_settings, embedder, provider, top_k, provider_problem)
+        reranker_name = getattr(run.reranker, "name", None) or "none"
         try:
             collection = run.meta.create_collection(golden.collection, "golden set evaluation")
             corpus = run.ingest(collection.id, golden.corpus_dir)
@@ -229,6 +242,7 @@ def run_eval(golden_path: Path, settings: Settings, *, live: bool) -> dict[str, 
         "corpus_dir": str(golden.corpus_dir),
         "top_k": top_k,
         "embedder": getattr(embedder, "name", type(embedder).__name__),
+        "reranker": reranker_name,
         "provider": getattr(provider, "name", None) if provider is not None else None,
         "model": ", ".join(models) if models else None,
         "knowledge_version": knowledge_version,
@@ -262,7 +276,8 @@ def format_report(report: dict[str, Any]) -> str:
     lines = [
         f"rag-kb eval  {report['golden_path']}",
         (
-            f"mode {report['mode']}: embedder {report['embedder']}, provider {report['provider'] or 'none'}"
+            f"mode {report['mode']}: embedder {report['embedder']}, reranker {report.get('reranker') or 'none'}, "
+            f"provider {report['provider'] or 'none'}"
             + (f" ({report['model']})" if report.get("model") else "")
         ),
         (

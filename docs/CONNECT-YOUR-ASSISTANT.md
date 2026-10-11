@@ -25,14 +25,15 @@ All four tools only read. Uploading, re-indexing and deleting stay in the rag-kb
 
 ### What `ask_knowledge_base` returns
 
-The same answer contract the web page uses, produced with the built-in extractive mode, plus two extra fields:
+The same answer contract the web page uses (`ARCHITECTURE.md` section 3), produced with the built-in extractive mode, plus two extra fields:
 
 | Field | Meaning |
 |---|---|
 | `status` | `answered`, `no_answer` (the documents do not cover it), `no_documents` (the collection is empty) or `retrieval_unavailable`. |
 | `answer` | A digest of the best sentences with `[n]` markers, or `null` when not answered. |
 | `message` | One plain sentence when not answered. |
-| `citations` | Numbered sources 1..K: `marker`, `title`, `page`, `section`, `snippet`, `score`. |
+| `citations` | Numbered sources 1..K: `marker`, `title`, `page` (and `page_end` when the passage runs onto a later page), `section`, `snippet`, and three scores: `score` (the rank fusion score, which only orders them), `vector_score` (cosine similarity to the question, 0 to 1, `null` when only the word search found it) and `rerank_score` (when the local reranker is on). |
+| `closest` | When `status` is `no_answer`: up to three of the nearest passages, in the same shape as `citations`, so the assistant can tell the user what came closest. They do not answer the question and must not be presented as an answer. Empty otherwise. |
 | `passages` | The full text of each cited passage, under the same `marker`. |
 | `guidance` | Two or three sentences telling the assistant how to write the final answer: in the user's language, direct answer first, inline `[n]` citations that match the sources, and a plain "the documents do not cover this" when they do not. |
 | `knowledge_version`, `id`, `created_at`, `language`, `passages_considered`, `provider` | Bookkeeping. The `id` lets you find the same brief later in the app. |
@@ -144,7 +145,7 @@ Both guards trust the `Host` header. A tunnel or proxy that rewrites `Host` to `
 | HTTP 503 `not_ready` | The app is still starting. Try again in a second. |
 | claude.ai says it cannot reach the server | A `127.0.0.1` address was used, the tunnel stopped, or `/mcp` is missing from the end of the address. |
 | Every answer comes back `no_documents` | The collection is empty or its documents are still processing. Check with `list_documents` or the Documents tab. |
-| `no_answer` for something the documents do say | Search did not find the passage. Try `search_knowledge_base` with different words, raise `top_k`, or check that the document indexed (status `ready`). |
+| `no_answer` for something the documents do say | Search did not find the passage. Look at `closest`, try `search_knowledge_base` with different words, raise `top_k`, or check that the document indexed (status `ready`). For documents or questions not in English, see "Languages" in `PROVIDERS.md`. |
 
 To check the endpoint by hand:
 

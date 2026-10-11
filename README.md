@@ -19,11 +19,13 @@ cd rag-kb
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
 pip install -e .
-ragkb doctor          # checks Claude Code / Codex sign-in, the embedding model (downloaded on first run), the data folder
+ragkb doctor          # checks Claude Code / Codex sign-in, the local models (downloaded on first run), the data folder
 ragkb serve --open    # opens http://127.0.0.1:8765
 ```
 
-Then create a collection in the sidebar, drop your documents in, and ask on the Ask tab.
+The first run downloads two small local models from the Hugging Face hub, once: the embedding model (about 130 MB) and the reranker (about 90 MB). `ragkb doctor` fetches both, so your first question does not wait on them.
+
+Then create a collection in the sidebar, drop your documents in (files, a whole folder or a `.zip`), and ask on the Ask tab.
 
 For AI-written answers, sign in once to the tool that matches your plan: `claude auth login` (Claude Pro or Max) or `codex login` (ChatGPT Plus or Pro). `ragkb doctor` shows what is missing and the command that fixes it. See [docs/PROVIDERS.md](docs/PROVIDERS.md).
 
@@ -53,7 +55,7 @@ Claude Desktop (through the `mcp-remote` bridge) and claude.ai (through a tunnel
 
 ```bash
 ragkb eval            # offline: deterministic, no model, runs in seconds
-ragkb eval --live     # the real embedding model and your answer provider (one call per question)
+ragkb eval --live     # the real models and your answer provider (at most one call per question)
 ```
 
 The evaluation indexes the golden set's corpus into a throwaway folder, asks every question and reports recall@k, MRR, citation rate and the false-answer rate on questions that must be declined, with a PASS, FAIL or SKIPPED verdict. Write a golden set for your own documents with [docs/EVALS.md](docs/EVALS.md).

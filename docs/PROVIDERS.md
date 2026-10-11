@@ -85,6 +85,14 @@ codex exec --skip-git-repo-check --ephemeral -s read-only -C <empty temp folder>
 
 No model at all. The answer is a short digest: a lead line, then one bullet per source with its most relevant sentences and a `[n]` citation. It declines ("not covered") when the passages found are not about the question, so it does not present loosely related text as an answer: each word of the question is weighted by how rare it is among the passages (generic words such as "company" or "year" count little), a specific word that no passage contains declines a short question, and one passage alone must hold at least half of the question's weight. It is always available, it is what `ragkb eval` uses offline, and it is what the MCP tools hand to an assistant that writes the final answer itself (see `CONNECT-YOUR-ASSISTANT.md`).
 
+## Languages
+
+Every provider answers in the language of the question, and the extractive digest quotes the documents as they are. Which passages reach the provider, though, is decided by the search, and the search depends on the **embedding model**, not on the provider.
+
+The default model, `BAAI/bge-small-en-v1.5`, is English-first. When a real share of your documents or questions is in another language, or people ask in one language about documents in another, set `RAGKB_EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`. That change needs **every document embedded again**: start with a new data folder and upload again, or choose Re-index on every document. The two models have the same size, so rag-kb cannot tell old vectors from new ones; until all documents are re-indexed, search quality is poor. Step by step: "Documents in other languages" in [USER-GUIDE.md](USER-GUIDE.md). A per-collection choice of embedding model is on the [roadmap](ROADMAP.md#2-quality).
+
+A better provider cannot make up for search in the wrong language: if "not covered" comes back for questions in another language that the documents do answer, look at the embedding model first.
+
 ## What rag-kb can and cannot see
 
 | rag-kb sees | rag-kb never sees |
@@ -109,6 +117,6 @@ No model at all. The answer is a short digest: a lead line, then one bullet per 
 | Claude Code answers fail although `claude auth status` says signed in | Check for a wrapper or alias that adds `--bare`, and for `CLAUDE_CODE_USE_BEDROCK` or similar variables that point Claude Code at another account. |
 | Answers are billed to an API account | `codex login status` says "API key", or `claude auth status` shows a Console login. Sign out and sign in with the subscription. |
 | The first answer of the day is slow | The tools start up and check their login on the first call; later calls are faster. Typical answers take 10 to 30 seconds. |
-| "not covered" for something the documents say | The provider worked; search did not find the passage. See "Reading the states and scores" in `USER-GUIDE.md`. |
+| "not covered" for something the documents say | The provider worked; search did not find the passage. Read the **Closest passages** under the answer, and see "Reading the states and scores" in `USER-GUIDE.md`. For documents or questions not in English, see "Languages" above. |
 
 Running rag-kb from inside a Claude Code session (for example a terminal opened by Claude Code) works: the variables that mark a nested session are removed before each call.

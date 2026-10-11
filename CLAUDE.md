@@ -18,7 +18,7 @@ Do these in order, and tell the person what you did and what is left for them. S
    pip install -e ".[dev]"
    ```
    On Windows, run the project's own interpreter explicitly when the shell does not activate: `.venv\Scripts\python.exe -m ragkb.cli ...`.
-3. **Run the health check.** `ragkb doctor` (or `python -m ragkb.cli doctor`). It reports Python, the embedding model (downloaded on the first run, about 130 MB, from the Hugging Face hub; it needs internet once), the data folder, and each answer provider: installed or not, signed in or not, and the exact command that fixes it.
+3. **Run the health check.** `ragkb doctor` (or `python -m ragkb.cli doctor`). It reports Python, the embedding model and the reranker (downloaded on the first run, about 130 MB and 90 MB, from the Hugging Face hub; it needs internet once), the data folder, and each answer provider: installed or not, signed in or not, and the exact command that fixes it.
 4. **Set up the subscription provider the person has.** Only one is needed; both can coexist.
    - **Claude Pro or Max:** Claude Code must be installed and signed in. Install: `npm install -g @anthropic-ai/claude-code` (needs Node.js 18 or newer), or the native installer from the Claude Code documentation. Sign in: `claude auth login` (opens the browser). The VS Code extension's bundled `claude` binary is detected automatically on Windows, so people who already use that extension need nothing else.
    - **ChatGPT Plus or Pro:** Codex must be installed and signed in. Install: `npm install -g @openai/codex`. Sign in: `codex login`. The VS Code ChatGPT extension's bundled `codex` is detected automatically on Windows.
@@ -41,7 +41,7 @@ Do these in order, and tell the person what you did and what is left for them. S
 | `ragkb` is not a command | The environment is not activated; use `python -m ragkb.cli` or activate `.venv`. |
 | Claude Code answers fail with "not signed in" although `claude auth status` says signed in | Something adds `--bare`, or `ANTHROPIC_API_KEY` or a Bedrock variable is set. rag-kb removes those for its own calls; check wrappers and aliases. |
 | Codex answers fail with a quota or rate message | The ChatGPT plan's Codex quota is small. Wait, or switch the provider to Claude Code or extractive in the Ask tab. |
-| The embedding model will not download | No internet, or a proxy. The hub cache is `fastembed_cache` in the temp folder; a corporate proxy needs `HTTPS_PROXY`. |
+| The embedding model or the reranker will not download | No internet, or a proxy. The hub cache is `fastembed_cache` in the temp folder; a corporate proxy needs `HTTPS_PROXY`. |
 | Port 8765 is busy | `ragkb serve --port 8800`. |
 | 403 on `/api` or `/mcp` | The request did not come from localhost. That is deliberate; see `RAGKB_API_PUBLIC` and `RAGKB_MCP_PUBLIC` in `.env.example`, and read the warning there before enabling them. |
 | A PDF is rejected as empty | It is a scanned image with no text layer. OCR is not built in yet. |

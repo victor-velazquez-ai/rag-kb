@@ -58,7 +58,7 @@ This is the same split as objective 1 (retrieval and honesty are ours, generatio
 ### 3.1 User-facing
 
 - **Collections.** Create, switch, delete. One knowledge base can hold several corpora (teams, topics, clients).
-- **Documents.** Drag-and-drop or pick many files. Each shows its status (queued, processing, ready, failed with reason), title, type, pages, chunks, size, uploaded and indexed times. Actions: open the original, view its passages, re-index, delete (two-click, with a short arm time). Re-uploading the same content is detected by hash and reported as "already indexed"; the same title with new content replaces the old version.
+- **Documents.** Drag-and-drop or pick many files. Each shows its status (queued, processing, ready, failed with reason), title, type, pages, chunks, size, uploaded and indexed times. Actions: open the original, view its passages, re-index, delete (two-click, with a short arm time). Re-uploading the same content is detected by hash and reported as "already indexed"; the same file name (or path, for a folder or zip upload) with new content replaces the old version, and titles may repeat.
 - **Ask.** A question box with provider and model choice, passage count, and the answer rendered as formatted text. Inline [n] markers highlight the matching source card. Sources show title, page or section, a snippet and a relevance bar. Thumbs up or down with an optional note. Elapsed time and model shown. Clear, distinct states for "no documents yet", "the documents do not cover this", "provider not signed in" and "search unavailable".
 - **Settings and health.** Which providers are installed and signed in, with the command to fix each; the embedding model; index size; the data folder; the knowledge version.
 - **Connect your assistant.** The local MCP address and setup steps for Claude Desktop and claude.ai, with the tool list.
@@ -95,7 +95,7 @@ OCR of scanned PDFs, multi-user auth and roles, cloud storage, scheduled re-craw
 | Vector and full-text store | **LanceDB** (embedded) | No server to install, one `pip install`, vector plus BM25 full-text plus hybrid in one library, fast on a laptop, portable data folder. Behind a store interface so pgvector can replace it for objective 2. |
 | Metadata | SQLite (standard library) | Collections, documents, jobs, feedback and audit need transactions and status updates; zero setup. |
 | Embeddings | **fastembed** with `BAAI/bge-small-en-v1.5` default | ONNX on CPU, no PyTorch, about 130 MB, good English quality. `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (also 384 dimensions) as the documented option for mixed-language corpora. Verified on this machine: 5 s to load and embed. |
-| Reranker | fastembed cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`), off by default | Local, cheap, measurable gain; off until the eval shows it helps. |
+| Reranker | fastembed cross-encoder (`Xenova/ms-marco-MiniLM-L-6-v2`), on by default | Local, cheap, about 90 MB. Calibrated on the sample golden set; its scores also let a question whose passages are all weak be declined before any model call. `RAGKB_RERANKER=none` turns it off. |
 | Parsing | pypdf, python-docx, markdown-it-py, BeautifulSoup, openpyxl, csv | Light, pure Python, cover the formats people actually upload. |
 | Answer generation | Claude Code CLI, Codex CLI, extractive | Section 2. |
 | UI | Single-page app in plain HTML, CSS and JavaScript served by FastAPI, no build step | Running locally must not require Node or a bundler. |
@@ -145,7 +145,6 @@ OCR of scanned PDFs, multi-user auth and roles, cloud storage, scheduled re-craw
 
 - **License** for the repo (private today). MIT if it is to be shared freely, otherwise a proprietary notice.
 - **Default embedding model**: English-first small model, or multilingual from day one at some cost in speed.
-- **Reranker on by default** once the eval shows the gain.
 - **OCR** for scanned PDFs (objective 2 candidate).
 
 Future tasks beyond this plan, including other subscriptions as providers, are tracked in `docs/ROADMAP.md`.
