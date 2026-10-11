@@ -26,9 +26,12 @@ class Settings(BaseSettings):
 
     # retrieval
     EMBED_MODEL: str = "BAAI/bge-small-en-v1.5"
-    RERANKER: str = "none"  # none | local
+    RERANKER: str = "local"  # none | local
     RERANK_MODEL: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     TOP_K: int = 6
+    # how many fused candidates to consider before reranking and budgeting
+    CANDIDATES: int = 30
+    NEIGHBOUR_EXPANSION: bool = True
     MIN_SCORE: float = 0.0
     MAX_CONTEXT_CHARS: int = 12000
 
@@ -36,6 +39,11 @@ class Settings(BaseSettings):
     CHUNK_TOKENS: int = 350
     CHUNK_OVERLAP_TOKENS: int = 60
     MAX_UPLOAD_MB: int = 50
+    # hard ceiling on a chunk's display text, in characters, whatever the token estimate says
+    MAX_CHUNK_CHARS: int = 4000
+    SKIP_HIDDEN_SHEETS: bool = True
+    INGEST_WORKERS: int = 2
+    EMBED_BATCH_SIZE: int = 64
 
     # answer providers
     PROVIDER: str = "auto"  # auto | claude_code | codex | extractive

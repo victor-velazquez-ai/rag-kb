@@ -20,6 +20,7 @@ class DocumentStatus(str, Enum):
     processing = "processing"
     ready = "ready"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class Document(BaseModel):
@@ -27,6 +28,9 @@ class Document(BaseModel):
     collection_id: str
     title: str
     filename: str
+    # Identity within a collection: the relative path from a folder or zip upload, else the filename.
+    # Titles are display only and may repeat.
+    source_path: str = ""
     media_type: str
     size_bytes: int
     content_hash: str
@@ -58,7 +62,10 @@ class Chunk(BaseModel):
     embed_text: str
     title: str
     section: str = ""
+    # page is the first page of the chunk; page_start and page_end bound every page it touches.
     page: int | None = None
+    page_start: int | None = None
+    page_end: int | None = None
     char_start: int = 0
     char_end: int = 0
     token_estimate: int = 0
@@ -71,6 +78,7 @@ class Hit(BaseModel):
     score: float
     vector_score: float | None = None
     lexical_rank: int | None = None
+    lexical_score: float | None = None
     rerank_score: float | None = None
 
 
@@ -79,10 +87,14 @@ class Citation(BaseModel):
     chunk_id: str
     doc_id: str
     title: str
+    # page is the page that contains the cited text; page_end is set when the passage spans pages.
     page: int | None = None
+    page_end: int | None = None
     section: str = ""
     snippet: str
     score: float
+    vector_score: float | None = None
+    rerank_score: float | None = None
 
 
 class AnswerStatus(str, Enum):
@@ -110,11 +122,16 @@ class Answer(BaseModel):
     answer: str | None = None
     message: str | None = None
     citations: list[Citation] = Field(default_factory=list)
+    # When the status is no_answer, the closest passages, so the person can judge for themselves.
+    closest: list[Citation] = Field(default_factory=list)
     passages_considered: int = 0
     provider: ProviderInfo | None = None
     knowledge_version: str = ""
     language: str | None = None
     created_at: datetime
+
+
+JobStage = Literal["queued", "parsing", "chunking", "embedding", "writing", "done", "failed", "cancelled"]
 
 
 class Job(BaseModel):
@@ -123,12 +140,25 @@ class Job(BaseModel):
     doc_id: str
     status: DocumentStatus
     error: str | None = None
+    filename: str = ""
+    stage: JobStage = "queued"
+    chunks_done: int = 0
+    chunks_total: int | None = None
+    bytes_total: int | None = None
+    eta_seconds: int | None = None
+    cancel_requested: bool = False
+    already_indexed: bool = False
+    replaced_doc_id: str | None = None
+    replaced_title: str | None = None
     created_at: datetime
     finished_at: datetime | None = None
 
 
 class Feedback(BaseModel):
+    id: str = ""
     answer_id: str
+    collection_id: str = ""
+    question: str = ""
     rating: Literal["up", "down"]
     note: str = ""
     created_at: datetime
