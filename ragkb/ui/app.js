@@ -5,60 +5,93 @@
  *
  * Loaded synchronously in <head> (not deferred): the saved theme is applied while the script runs, before the
  * first paint, and everything else waits for DOMContentLoaded.
+ *
+ * Addresses: #/c/<collection id>/<tab>, #/<tab> when no collection exists, #/answer/<answer id>. Back and
+ * Forward move between tabs and collections; a reload opens the same view.
  */
 (() => {
   'use strict';
 
   const TABS = ['documents', 'ask', 'settings', 'connect', 'help'];
-  const ACTIVE = new Set(['queued', 'processing', 'uploading', 'waiting']);
+  // Upload rows that are still moving: waiting in this browser, uploading, or a job on the server.
+  const ACTIVE = new Set(['waiting', 'uploading', 'queued', 'processing', 'cancelling']);
+  // Server-side states worth polling.
+  const TRACKED = new Set(['queued', 'processing', 'cancelling']);
+  const BAR_STATES = new Set(['waiting', 'uploading', 'queued', 'processing', 'cancelling', 'ready']);
+  const JOB_ACTIVE = new Set(['queued', 'processing']);
+  const WORK_STAGES = new Set(['parsing', 'chunking', 'embedding', 'writing']);
   const ARM_MS = 4000;
+  const PENDING_NOTE_MS = 2000;
   const HEALTH_EVERY_MS = 20000;
+  const JOB_POLL_MS = 1000;
+  const DOCS_POLL_MS = 2000;
   const PROVIDER_LABELS = { claude_code: 'Claude Code', codex: 'Codex', extractive: 'Extractive mode (no AI)' };
   const AUTO_ORDER = ['claude_code', 'codex', 'extractive'];
   const CLAUDE_MODELS = ['sonnet', 'opus', 'haiku'];
   const STATUS_LABELS = {
-    queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed',
-    uploading: 'Uploading', waiting: 'Waiting', known: 'Already indexed',
+    queued: 'Queued', processing: 'Processing', ready: 'Ready', failed: 'Failed', cancelled: 'Cancelled',
+    waiting: 'Queued', uploading: 'Uploading', cancelling: 'Cancelling', known: 'Already indexed',
+    rejected: 'Rejected', unpacked: 'Unpacked', skipped: 'Skipped',
+  };
+  const CHIP_TONES = { waiting: 'queued', cancelling: 'warn', unpacked: 'known', skipped: 'queued', rejected: 'failed' };
+  const STAGE_LABELS = {
+    parsing: 'Reading the file', chunking: 'Splitting into passages', embedding: 'Embedding passages',
+    writing: 'Writing to the index',
   };
   const TYPE_LABELS = {
     'application/pdf': 'PDF',
     'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'Word',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'Excel',
     'text/markdown': 'Markdown', 'text/html': 'HTML', 'text/plain': 'Text', 'text/csv': 'CSV',
-    'text/tab-separated-values': 'TSV',
+    'text/tab-separated-values': 'TSV', 'application/zip': 'Zip',
   };
   const MCP_TOOLS = {
-    list_collections: 'Lists the collections with their ids and how many documents each holds.',
+    list_collections: 'Lists the collections with their ids and how many searchable documents each holds.',
     list_documents: 'Lists the documents of a collection with pages, passages and when each was indexed.',
     search_knowledge_base: 'Returns the best passages for a query, with title, page, section and score. No answer is written.',
     ask_knowledge_base: 'Returns a cited brief for a question. Your assistant writes the final answer from it.',
   };
   const OUT_OF_SCOPE_PROBE = 'What is the boiling point of mercury?';
+  const ARCHIVE = '.zip';
+  const SHELLS = [['bash', 'bash'], ['powershell', 'PowerShell'], ['cmd', 'cmd']];
+  const BACKSLASH = String.fromCharCode(92);
 
   const state = {
     tab: 'documents',
     health: null,
+    healthFresh: false,
     offline: false,
     providers: [],
     providersError: null,
+    providersLoadedAt: 0,
     collections: [],
     collectionsError: null,
     current: null,
     docs: [],
+    docsLoaded: false,
     docsSig: '',
     docsError: null,
     stats: null,
+    summary: null,
     expanded: new Set(),
+    pending: new Map(),
     uploads: [],
     answerToken: 0,
+    answerId: null,
     asking: false,
   };
   const chunkCache = new Map();
+  const jobCache = new Map();
+  let rowCache = new Map();
+  let drawerCache = new Map();
+  let uploadRowCache = new Map();
   let docsTimer = null;
   let jobTimer = null;
   let jobBusy = false;
   let uploadSeq = 0;
   let activeUploads = 0;
+  let shellSeq = 0;
+  let lastHash = null;
   const uploadQueue = [];
 
   // ------------------------------------------------------------------ small helpers
@@ -101,6 +134,23 @@
     } catch (e) {
       return fallback;
     }
+  }
+
+  function storeJson(key, value) {
+    try { store(key, JSON.stringify(value)); } catch (e) { /* a value that cannot be saved is simply not cached */ }
+  }
+
+  function recallJson(key) {
+    try {
+      const raw = recall(key, '');
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function finite(value) {
+    return typeof value === 'number' && Number.isFinite(value);
   }
 
   // ------------------------------------------------------------------ theme
@@ -169,18 +219,36 @@
     return { text: date.toLocaleDateString(undefined, { dateStyle: 'medium' }), title: full };
   }
 
-  function whenCell(iso) {
+  function whenCell(iso, extraClass) {
     const w = fmtWhen(iso);
-    return h('td', { class: 'when', title: w.title || null }, w.text || '');
+    return h('td', { class: 'when' + (extraClass ? ' ' + extraClass : ''), title: w.title || null }, w.text || '');
   }
 
   function fmtSeconds(ms) {
     return (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + ' s';
   }
 
+  function fmtEta(seconds) {
+    if (!finite(seconds) || seconds <= 0) return '';
+    if (seconds < 60) return 'about ' + Math.max(1, Math.round(seconds)) + ' s left';
+    return 'about ' + plural(Math.round(seconds / 60), 'minute') + ' left';
+  }
+
+  // The fused rank score: small numbers, three decimals.
   function fmtScore(value) {
-    if (typeof value !== 'number' || !Number.isFinite(value)) return '';
+    if (!finite(value)) return '';
     return value >= 1 ? value.toFixed(2) : value.toFixed(3);
+  }
+
+  // Similarity and reranker scores: two decimals.
+  function fmtRelevance(value) {
+    return finite(value) ? value.toFixed(2) : '';
+  }
+
+  function pagesLabel(page, pageEnd) {
+    if (page === null || page === undefined) return '';
+    if (pageEnd !== null && pageEnd !== undefined && pageEnd !== page) return 'pages ' + page + ' to ' + pageEnd;
+    return 'page ' + page;
   }
 
   function suffixOf(name) {
@@ -190,6 +258,46 @@
 
   function plural(n, one, many) {
     return n + ' ' + (n === 1 ? one : (many || one + 's'));
+  }
+
+  function spinner() {
+    return h('span', { class: 'spinner spinner-small', 'aria-hidden': 'true' });
+  }
+
+  /* Puts `nodes` into `parent` in order, keeping nodes that are already there in place, so a row that did not
+   * change keeps its focus and its armed state while its neighbours update. */
+  function reconcile(parent, nodes) {
+    const wanted = new Set(nodes);
+    let cursor = parent.firstChild;
+    for (const node of nodes) {
+      while (cursor && !wanted.has(cursor)) {
+        const next = cursor.nextSibling;
+        cursor.remove();
+        cursor = next;
+      }
+      if (node === cursor) {
+        cursor = cursor.nextSibling;
+        continue;
+      }
+      parent.insertBefore(node, cursor);
+    }
+    while (cursor) {
+      const next = cursor.nextSibling;
+      cursor.remove();
+      cursor = next;
+    }
+  }
+
+  /* Remembers which keyed control has the focus inside `parent`, and puts it back after a re-render. */
+  function keepFocus(parent, render) {
+    const active = document.activeElement;
+    const holder = active && parent.contains(active) ? active.closest('[data-key]') : null;
+    const memo = holder && active.dataset.action ? { key: holder.dataset.key, action: active.dataset.action } : null;
+    render();
+    if (memo && !parent.contains(active)) {
+      const target = parent.querySelector('[data-key="' + CSS.escape(memo.key) + '"] [data-action="' + CSS.escape(memo.action) + '"]');
+      if (target && !target.disabled) target.focus();
+    }
   }
 
   // ------------------------------------------------------------------ API
@@ -295,6 +403,22 @@
     return button;
   }
 
+  /* Shows a spinner and a label on a button while an action runs, and a longer note after two seconds. */
+  function busyButton(button, label, slowLabel) {
+    const idle = button.textContent;
+    button.replaceChildren(spinner(), ' ' + label);
+    button.setAttribute('aria-busy', 'true');
+    const timer = window.setTimeout(() => {
+      button.replaceChildren(spinner(), ' ' + slowLabel);
+      announce(slowLabel);
+    }, PENDING_NOTE_MS);
+    return () => {
+      window.clearTimeout(timer);
+      button.removeAttribute('aria-busy');
+      button.textContent = idle;
+    };
+  }
+
   // ------------------------------------------------------------------ markdown (escape first, then format)
 
   function citeButton(n) {
@@ -383,7 +507,54 @@
     return out.join('');
   }
 
-  // ------------------------------------------------------------------ tabs and routing
+  // ------------------------------------------------------------------ routing: #/c/<id>/<tab>, #/<tab>, #/answer/<id>
+
+  function hashFor(collectionId, tab) {
+    return collectionId ? '#/c/' + enc(collectionId) + '/' + tab : '#/' + tab;
+  }
+
+  function parseHash(hash) {
+    const raw = String(hash || '').replace(/^#\/?/, '');
+    if (!raw) return null;
+    const parts = raw.split('/').map((part) => {
+      try { return decodeURIComponent(part); } catch (e) { return part; }
+    });
+    if (parts[0] === 'c' && parts[1]) return { cid: parts[1], tab: TABS.includes(parts[2]) ? parts[2] : 'documents' };
+    if (parts[0] === 'answer' && parts[1]) return { answer: parts[1] };
+    // The older forms: #ask/<answer id> and #<tab>.
+    if (parts[0] === 'ask' && parts[1]) return { answer: parts[1] };
+    if (TABS.includes(parts[0])) return { tab: parts[0] };
+    return null;
+  }
+
+  /* mode: 'push' adds a history entry (Back returns here), 'replace' corrects the address, 'none' only records it. */
+  function setRoute(hash, mode) {
+    if (mode !== 'none' && location.hash !== hash) {
+      if (mode === 'replace') history.replaceState(null, '', hash);
+      else history.pushState(null, '', hash);
+    }
+    lastHash = location.hash;
+  }
+
+  async function onLocationChange() {
+    if (location.hash === lastHash) return;
+    lastHash = location.hash;
+    const route = parseHash(location.hash);
+    if (!route) return;
+    if (route.answer) {
+      // 'replace' turns the older #ask/<id> into #/answer/<id>; the current form is left as it is.
+      await loadStoredAnswer(route.answer, 'replace');
+      return;
+    }
+    if (route.tab && route.tab !== state.tab) selectTab(route.tab, { route: 'none' });
+    if (route.cid && route.cid !== state.current && state.collections.some((c) => c.id === route.cid)) {
+      await selectCollection(route.cid, false, 'none');
+    }
+    // An older or partial address (#ask, #/help, an unknown collection) is corrected in place.
+    if (location.hash === lastHash) setRoute(hashFor(state.current, state.tab), 'replace');
+  }
+
+  // ------------------------------------------------------------------ tabs
 
   function selectTab(name, options) {
     const opts = options || {};
@@ -398,11 +569,11 @@
     state.tab = name;
     store('tab', name);
     if (opts.focus) $('tab-' + name).focus();
-    if (opts.hash !== false) {
-      const current = location.hash.replace(/^#/, '').split('/')[0];
-      if (current !== name) history.replaceState(null, '', '#' + name);
+    setRoute(hashFor(state.current, name), opts.route || 'push');
+    if (name === 'settings') {
+      renderSettings(true);
+      renderFeedbackPanel();
     }
-    if (name === 'settings') renderSettings(true);
     if (name === 'connect') renderConnect();
     if (name === 'ask') loadProviders(false);
   }
@@ -427,31 +598,44 @@
     });
   }
 
-  /* #documents, #ask, #settings, #connect, #help, and #ask/<answer id> for a stored answer. */
-  function routeFromHash(withAnswer) {
-    const [tab, arg] = location.hash.replace(/^#/, '').split('/');
-    if (TABS.includes(tab)) {
-      selectTab(tab, { hash: false });
-      if (withAnswer && tab === 'ask' && arg) loadStoredAnswer(decodeURIComponent(arg));
-      return true;
-    }
-    return false;
-  }
-
   function isTyping(target) {
     return target && (target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName));
   }
 
   // ------------------------------------------------------------------ health, banner, status bar
 
+  /* The last known health and provider states, shown at once on a reload until the fresh ones arrive. */
+  function restoreCached() {
+    const health = recallJson('health');
+    if (health && typeof health === 'object' && health.status) {
+      state.health = health;
+      renderHealth();
+    }
+    const providers = recallJson('providers');
+    if (Array.isArray(providers) && providers.length) {
+      state.providers = providers;
+      renderProviderBadge();
+      renderProviderControls();
+    }
+  }
+
   async function loadHealth() {
     try {
       state.health = await api('GET', '/api/health');
+      state.healthFresh = true;
       state.offline = false;
+      storeJson('health', state.health);
     } catch (e) {
       state.offline = true;
     }
     renderHealth();
+  }
+
+  function acceptedTypes() {
+    const list = (state.health && state.health.supported_types) || [];
+    const types = new Set(list.map((t) => String(t).toLowerCase()));
+    if (types.size) types.add(ARCHIVE);
+    return types;
   }
 
   function renderHealth() {
@@ -471,11 +655,11 @@
       badge.textContent = ok ? 'Healthy' : 'Degraded';
       badge.title = ok ? 'All parts are working.' : 'Some parts are not working: ' + (health.problems || []).join('; ');
       const storeDown = health.store && (health.store.metadata !== 'ok' || health.store.vector !== 'ok');
-      if (storeDown) {
+      if (storeDown && state.healthFresh) {
         banner.className = 'banner';
         banner.textContent = 'The document store is not available. Uploads, search and answers can fail until it is back. See Settings for details.';
         banner.hidden = false;
-      } else {
+      } else if (!banner.classList.contains('warn')) {
         banner.hidden = true;
       }
     }
@@ -484,14 +668,15 @@
       $('status-data').textContent = health.data_dir || '';
       $('status-data').title = health.data_dir || '';
       $('status-app-version').textContent = health.version || '';
-      const hint = $('dropzone-hint');
-      const types = (health.supported_types || []).join(' ');
-      hint.textContent = (types ? types + ', ' : '') + 'up to ' + health.max_upload_mb + ' MB each';
-      $('file-input').accept = (health.supported_types || []).join(',');
+      const types = Array.from(acceptedTypes());
+      $('dropzone-hint').textContent = (types.length ? types.join(' ') + ', ' : '') + 'up to ' + health.max_upload_mb + ' MB each';
+      $('file-input').accept = types.join(',');
       const topk = $('topk-input');
       if (!topk.dataset.touched && !recall('topk', '')) topk.value = String(health.top_k || 6);
     }
-    $('status-checked').textContent = 'checked ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (state.healthFresh || state.offline) {
+      $('status-checked').textContent = 'checked ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
     renderProviderBadge();
   }
 
@@ -505,6 +690,7 @@
       state.providers = await api('GET', '/api/providers' + (refresh ? '?refresh=1' : ''));
       state.providersError = null;
       state.providersLoadedAt = Date.now();
+      storeJson('providers', state.providers);
     } catch (e) {
       state.providers = [];
       state.providersError = e.message;
@@ -537,6 +723,7 @@
   function renderProviderBadge() {
     const badge = $('provider-badge');
     if (!state.providers.length) {
+      // Before the first answer from the server there is nothing better to show; afterwards the cache is used.
       badge.className = 'badge badge-muted';
       badge.textContent = state.providersError ? 'Providers unknown' : 'Provider';
       badge.title = state.providersError || 'Checking the answer providers';
@@ -592,8 +779,8 @@
     renderModelControl();
   }
 
+  /* The Model menu stays in place for every provider; it is disabled when the provider has no models. */
   function renderModelControl() {
-    const field = $('model-field');
     const select = $('model-select');
     const provider = chosenProvider();
     const status = providerStatus(provider);
@@ -605,16 +792,63 @@
     } else if (provider === 'codex') {
       fallback = (state.health && state.health.codex_model) || 'the CLI default';
     }
-    if (!models.length || provider === 'extractive') {
-      field.hidden = true;
-      select.replaceChildren();
+    if (provider === 'extractive' || !models.length) {
+      const label = provider === 'codex' ? 'Default (' + fallback + ')' : 'no model';
+      select.replaceChildren(h('option', { value: '' }, label));
+      select.value = '';
+      select.disabled = true;
+      select.title = provider === 'extractive'
+        ? 'Extractive mode uses no model.'
+        : providerLabel(provider) + ' lists no models here; its default is used.';
       return;
     }
     const previous = select.value || recall('model.' + provider, '');
     select.replaceChildren(h('option', { value: '' }, 'Default (' + fallback + ')'));
     for (const model of models) select.append(h('option', { value: model }, model));
     select.value = models.includes(previous) ? previous : '';
-    field.hidden = false;
+    select.disabled = false;
+    select.title = '';
+  }
+
+  // ------------------------------------------------------------------ counts: searchable documents first
+
+  function statusCounts(byStatus) {
+    const b = byStatus || {};
+    const n = (key) => Number(b[key]) || 0;
+    return { ready: n('ready'), processing: n('queued') + n('processing'), failed: n('failed'), cancelled: n('cancelled') };
+  }
+
+  function countsFromDocs(docs) {
+    const byStatus = {};
+    for (const doc of docs) byStatus[doc.status] = (byStatus[doc.status] || 0) + 1;
+    return statusCounts(byStatus);
+  }
+
+  /* GET /api/collections: `documents` (ready), `documents_total` and `documents_by_status` on every row. */
+  function collectionCounts(collection) {
+    if (collection.id === state.current && state.docsLoaded) return countsFromDocs(state.docs);
+    return statusCounts(collection.documents_by_status);
+  }
+
+  /* GET /api/collections/{cid}/stats: `documents_ready` and `documents_by_status`. */
+  function statsCounts(stats) {
+    const counts = statusCounts(stats.documents_by_status);
+    counts.ready = Number(stats.documents_ready) || 0;
+    return counts;
+  }
+
+  /* The secondary note: what is not searchable yet, or will not be. */
+  function countsNote(counts) {
+    const parts = [];
+    if (counts.processing) parts.push(counts.processing + ' processing');
+    if (counts.failed) parts.push(counts.failed + ' failed');
+    if (counts.cancelled) parts.push(counts.cancelled + ' cancelled');
+    return parts.join(', ');
+  }
+
+  function searchableText(counts) {
+    const note = countsNote(counts);
+    return plural(counts.ready, 'searchable document') + (note ? ' (' + note + ')' : '');
   }
 
   // ------------------------------------------------------------------ collections
@@ -623,7 +857,7 @@
     return state.collections.find((c) => c.id === state.current) || null;
   }
 
-  async function loadCollections(preferId) {
+  async function loadCollections(preferId, route) {
     try {
       state.collections = await api('GET', '/api/collections');
       state.collectionsError = null;
@@ -634,24 +868,42 @@
     let target = preferId || state.current || recall('collection', '');
     if (!state.collections.some((c) => c.id === target)) target = state.collections.length ? state.collections[0].id : null;
     renderCollections();
-    await selectCollection(target, true);
+    await selectCollection(target, true, route || 'replace');
   }
+
+  let collectionsSig = '';
 
   function renderCollections() {
     const list = $('collection-list');
+    // The list is rebuilt only when something in it changed, so a focused button keeps its focus during polling.
+    const sig = JSON.stringify([state.current, state.collectionsError,
+      state.collections.map((c) => [c.id, c.name, c.description, collectionCounts(c)])]);
+    if (sig === collectionsSig && list.childElementCount === state.collections.length) return;
+    collectionsSig = sig;
     list.replaceChildren();
     for (const collection of state.collections) {
       const current = collection.id === state.current;
+      const counts = collectionCounts(collection);
+      const note = countsNote(counts);
+      const nameId = 'collection-label-' + collection.id;
+      const descId = 'collection-desc-' + collection.id;
+      const description = [collection.description, searchableText(counts)].filter(Boolean).join('. ');
+      // The accessible name is the collection's name alone; the description and counts are its description.
       list.append(h('li', {},
         h('button', {
           type: 'button',
           class: 'collection-item',
           'aria-current': current ? 'true' : null,
-          title: collection.description || collection.name,
+          'aria-labelledby': nameId,
+          'aria-describedby': descId,
+          title: collection.description || null,
           onclick: () => selectCollection(collection.id, false),
         },
-        h('span', { class: 'collection-name' }, collection.name),
-        h('span', { class: 'count', 'aria-label': plural(collection.documents || 0, 'document') }, String(collection.documents || 0)))));
+        h('span', { class: 'collection-text' },
+          h('span', { class: 'collection-name', id: nameId }, collection.name),
+          note ? h('span', { class: 'collection-note', 'aria-hidden': 'true' }, note) : null),
+        h('span', { class: 'count', 'aria-hidden': 'true' }, String(counts.ready)),
+        h('span', { class: 'sr-only', id: descId }, description))));
     }
     const empty = $('collection-empty');
     empty.hidden = state.collections.length > 0;
@@ -660,25 +912,34 @@
       : 'No collections yet. Create one below.';
   }
 
-  async function selectCollection(id, force) {
+  async function selectCollection(id, force, route) {
     if (id === state.current && !force) return;
     const changed = id !== state.current;
     state.current = id || null;
     store('collection', id || '');
     if (changed) {
       state.docs = [];
+      state.docsLoaded = false;
       state.docsSig = '';
       state.stats = null;
+      state.summary = null;
       state.docsError = null;
       state.expanded.clear();
+      state.pending.clear();
       clearAnswer();
     }
+    setRoute(hashFor(state.current, state.tab), route || 'push');
     renderCollections();
     renderCollectionHeader();
     renderDocs();
+    renderSummary();
     renderUploads();
     renderAskAvailability();
     if (state.current) await loadDocs();
+    if (changed && state.tab === 'settings') {
+      renderSettings(false);
+      renderFeedbackPanel();
+    }
   }
 
   function renderCollectionHeader() {
@@ -697,9 +958,10 @@
     document.title = collection.name + ' | rag-kb';
     const parts = [];
     if (collection.description) parts.push(collection.description);
+    const counts = state.docsLoaded ? countsFromDocs(state.docs) : (state.stats ? statsCounts(state.stats) : null);
+    if (counts) parts.push(searchableText(counts));
     if (state.stats) {
-      parts.push(plural(state.stats.documents, 'document'));
-      parts.push(plural(state.stats.chunks, 'passage'));
+      parts.push(plural(state.stats.chunks || 0, 'passage'));
       if (state.stats.last_indexed_at) parts.push('last indexed ' + fmtWhen(state.stats.last_indexed_at).text);
     }
     meta.textContent = parts.join('  |  ');
@@ -726,8 +988,8 @@
         const created = await api('POST', '/api/collections', { name, description });
         form.reset();
         announce('Collection ' + created.name + ' created.');
-        await loadCollections(created.id);
-        selectTab('documents');
+        await loadCollections(created.id, 'push');
+        selectTab('documents', { route: 'replace' });
       } catch (e) {
         error.textContent = e.message;
         error.hidden = false;
@@ -736,23 +998,27 @@
       }
     });
 
-    armButton($('collection-delete'), {
+    const remove = $('collection-delete');
+    armButton(remove, {
       idle: 'Delete collection',
       armed: () => {
-        const n = state.stats ? state.stats.documents : (currentCollection() || {}).documents || 0;
+        const n = state.docsLoaded ? state.docs.length : (state.stats ? Number(state.stats.documents_total) || 0 : 0);
         return n ? 'Click again to delete it and ' + plural(n, 'document') : 'Click again to delete';
       },
       onConfirm: async () => {
         const collection = currentCollection();
         if (!collection) return;
+        const done = busyButton(remove, 'Deleting', 'Still deleting: a large collection takes a few seconds');
         try {
-          await api('DELETE', '/api/collections/' + enc(collection.id));
-          announce('Collection ' + collection.name + ' deleted.');
+          const result = await api('DELETE', '/api/collections/' + enc(collection.id));
+          announce('Collection ' + collection.name + (result && result.pending ? ': ' + result.message : ' deleted.'));
           state.current = null;
-          await loadCollections(null);
+          await loadCollections(null, 'replace');
           loadHealth();
         } catch (e) {
           showBannerMessage('The collection could not be deleted: ' + e.message);
+        } finally {
+          done();
         }
       },
     });
@@ -763,51 +1029,224 @@
     banner.className = 'banner warn';
     banner.textContent = text;
     banner.hidden = false;
-    window.setTimeout(() => { if (banner.textContent === text) banner.hidden = true; }, 8000);
+    window.setTimeout(() => {
+      if (banner.textContent === text) {
+        banner.hidden = true;
+        banner.className = 'banner';
+      }
+    }, 8000);
+  }
+
+  // ------------------------------------------------------------------ jobs: stage, progress, cancel
+
+  /* Queued while the job waits for a worker, processing once a worker has started it. */
+  function jobDisplayStatus(job) {
+    const status = job.status;
+    if (status === 'ready' || status === 'failed' || status === 'cancelled') return status;
+    if (job.cancel_requested) return 'cancelling';
+    return status === 'processing' || WORK_STAGES.has(job.stage) ? 'processing' : 'queued';
+  }
+
+  function jobProgressText(job) {
+    const status = jobDisplayStatus(job);
+    if (status === 'queued') return 'Waiting for a free worker';
+    if (status === 'cancelling') return 'Cancelling: it stops after the current step';
+    if (status !== 'processing') return '';
+    const stage = WORK_STAGES.has(job.stage) ? job.stage : null;
+    let text;
+    if (stage === 'embedding' && job.chunks_total) {
+      text = 'Embedding ' + (job.chunks_done || 0) + ' of ' + plural(job.chunks_total, 'passage');
+    } else if (stage === 'writing' && job.chunks_total) {
+      text = 'Writing ' + plural(job.chunks_total, 'passage') + ' to the index';
+    } else {
+      text = stage ? STAGE_LABELS[stage] : 'Processing';
+    }
+    const eta = fmtEta(job.eta_seconds);
+    return eta ? text + ', ' + eta : text;
+  }
+
+  /* Overall progress of a job in percent, or null when the stage is unknown (an indeterminate bar). */
+  function jobPercent(job) {
+    const status = jobDisplayStatus(job);
+    if (status === 'ready' || status === 'failed' || status === 'cancelled') return 100;
+    if (status === 'queued') return 0;
+    if (job.stage === 'parsing') return 5;
+    if (job.stage === 'chunking') return 15;
+    if (job.stage === 'embedding') {
+      const share = job.chunks_total ? Math.min(1, (job.chunks_done || 0) / job.chunks_total) : 0;
+      return Math.round(20 + 75 * share);
+    }
+    if (job.stage === 'writing') return 97;
+    return null;
+  }
+
+  function progressBar(percent, label, extraClass) {
+    const bar = h('progress', { max: '100', class: extraClass || null, 'aria-label': label });
+    if (percent !== null && percent !== undefined) bar.value = percent;
+    return bar;
+  }
+
+  async function refreshJobs(cid) {
+    try {
+      const jobs = await api('GET', '/api/collections/' + enc(cid) + '/jobs?limit=500');
+      if (!Array.isArray(jobs)) return null;
+      for (const job of jobs) if (job && job.id) jobCache.set(job.id, job);
+      return jobs;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function activeJobFor(docId) {
+    let best = null;
+    for (const job of jobCache.values()) {
+      if (job.doc_id !== docId || !JOB_ACTIVE.has(job.status)) continue;
+      if (!best || String(job.created_at) > String(best.created_at)) best = job;
+    }
+    return best;
+  }
+
+  async function cancelJob(jobId, button) {
+    if (button) button.disabled = true;
+    try {
+      const job = await api('POST', '/api/jobs/' + enc(jobId) + '/cancel');
+      if (job && job.id) {
+        jobCache.set(job.id, job);
+        for (const item of state.uploads) if (item.jobId === job.id) applyJob(item, job);
+      }
+      announce('Cancel requested.');
+      ensureJobPolling();
+    } catch (e) {
+      showBannerMessage('The job could not be cancelled: ' + e.message);
+      if (button) button.disabled = false;
+    }
+    renderUploads();
+    scheduleDocs(0);
   }
 
   // ------------------------------------------------------------------ documents
+
+  function scheduleDocs(delay) {
+    window.clearTimeout(docsTimer);
+    docsTimer = window.setTimeout(loadDocs, delay);
+  }
+
+  function jobSignature(job) {
+    return job ? [job.id, job.status, job.stage, job.chunks_done, job.chunks_total, job.eta_seconds, job.cancel_requested].join(':') : '';
+  }
 
   async function loadDocs() {
     const cid = state.current;
     if (!cid) return;
     window.clearTimeout(docsTimer);
+    docsTimer = null;
     try {
-      const [docs, stats] = await Promise.all([
-        api('GET', '/api/collections/' + enc(cid) + '/documents'),
-        api('GET', '/api/collections/' + enc(cid) + '/stats').catch(() => null),
+      const base = '/api/collections/' + enc(cid);
+      const [docs, stats, summary] = await Promise.all([
+        api('GET', base + '/documents'),
+        api('GET', base + '/stats').catch(() => null),
+        api('GET', base + '/jobs/summary').catch(() => null),
       ]);
+      if (cid !== state.current) return;
+      if (docs.some((d) => JOB_ACTIVE.has(d.status))) await refreshJobs(cid);
       if (cid !== state.current) return;
       state.docsError = null;
       state.stats = stats;
-      const sig = JSON.stringify(docs);
+      state.summary = summary && typeof summary === 'object' && !Array.isArray(summary) ? summary : null;
+      state.docsLoaded = true;
+      const sig = JSON.stringify(docs) + docs.map((d) => jobSignature(activeJobFor(d.id))).join('|');
       if (sig !== state.docsSig) {
         state.docs = docs;
         state.docsSig = sig;
         renderDocs();
         renderSuggestions();
       }
-      const collection = currentCollection();
-      if (collection && collection.documents !== docs.length) {
-        collection.documents = docs.length;
-        renderCollections();
-      }
+      renderSummary();
+      renderCollections();
       renderCollectionHeader();
     } catch (e) {
       if (cid !== state.current) return;
       if (e.status === 404) {
-        await loadCollections(null);
+        await loadCollections(null, 'replace');
         return;
       }
       state.docsError = e.message;
       state.docsSig = '';
       renderDocs();
     }
-    if (state.docs.some((d) => ACTIVE.has(d.status))) docsTimer = window.setTimeout(loadDocs, 2000);
+    if (state.current === cid && state.docs.some((d) => JOB_ACTIVE.has(d.status))) {
+      window.clearTimeout(docsTimer);
+      docsTimer = window.setTimeout(loadDocs, DOCS_POLL_MS);
+    }
   }
 
   function chip(status, label) {
-    return h('span', { class: 'chip chip-' + status }, label || STATUS_LABELS[status] || status);
+    return h('span', { class: 'chip chip-' + (CHIP_TONES[status] || status) }, label || STATUS_LABELS[status] || status);
+  }
+
+  /* The queue line: "42 ready, 3 failed, 1 replaced, 2 duplicates", from the job summary when the server has it. */
+  function renderSummary() {
+    const box = $('docs-summary');
+    const summary = state.summary;
+    const parts = [];
+    let lead = '';
+    if (state.current && summary && finite(summary.total)) {
+      lead = 'Uploads: ';
+      const add = (key, one, many, tone) => {
+        const n = Number(summary[key]) || 0;
+        if (n) parts.push([plural(n, one, many), tone]);
+      };
+      add('processing', 'processing', 'processing', 'info');
+      add('queued', 'queued', 'queued', '');
+      add('ready', 'ready', 'ready', '');
+      add('failed', 'failed', 'failed', 'err');
+      add('cancelled', 'cancelled', 'cancelled', '');
+      add('replaced', 'replaced', 'replaced', '');
+      add('duplicates', 'duplicate', 'duplicates', '');
+    } else if (state.current && state.docs.length) {
+      lead = 'Documents: ';
+      const counts = countsFromDocs(state.docs);
+      if (counts.processing) parts.push([counts.processing + ' processing', 'info']);
+      parts.push([counts.ready + ' ready', '']);
+      if (counts.failed) parts.push([counts.failed + ' failed', 'err']);
+      if (counts.cancelled) parts.push([counts.cancelled + ' cancelled', '']);
+    }
+    box.replaceChildren();
+    box.hidden = !parts.length;
+    if (!parts.length) return;
+    box.append(h('span', { class: 'muted' }, lead));
+    parts.forEach(([text, tone], i) => {
+      if (i) box.append(h('span', { class: 'muted' }, ', '));
+      box.append(h('span', { class: tone === 'err' ? 'error-text' : (tone === 'info' ? 'info-text' : null) }, text));
+    });
+  }
+
+  function visibleColumns() {
+    let n = 0;
+    for (const th of document.querySelectorAll('#docs-table thead th')) {
+      if (getComputedStyle(th).display !== 'none') n += 1;
+    }
+    return n || 7;
+  }
+
+  /* Columns drop out as the table gets narrower (see the container queries in styles.css); full-width cells
+   * follow so the passages drawer always spans the whole table. */
+  function setupDocsLayout() {
+    const wrap = document.querySelector('.table-wrap');
+    if (!wrap || typeof ResizeObserver === 'undefined') return;
+    let last = 0;
+    new ResizeObserver(() => {
+      const n = visibleColumns();
+      if (n === last) return;
+      last = n;
+      for (const td of document.querySelectorAll('#docs-tbody td.span-all')) td.colSpan = n;
+    }).observe(wrap);
+  }
+
+  function rowSignature(doc) {
+    const pending = state.pending.get(doc.id);
+    return JSON.stringify([doc, jobSignature(JOB_ACTIVE.has(doc.status) ? activeJobFor(doc.id) : null),
+      pending ? pending.action + (pending.slow ? '+' : '') : '', state.expanded.has(doc.id)]);
   }
 
   function renderDocs() {
@@ -815,71 +1254,163 @@
     $('docs-no-collection').hidden = has;
     $('docs-body').hidden = !has;
     const body = $('docs-tbody');
-    body.replaceChildren();
-    if (!has) return;
+    if (!has) {
+      body.replaceChildren();
+      rowCache = new Map();
+      drawerCache = new Map();
+      return;
+    }
+    const span = visibleColumns();
     if (state.docsError) {
-      body.append(h('tr', {}, h('td', { colspan: 9, class: 'table-message error-text' },
+      body.replaceChildren(h('tr', {}, h('td', { colspan: span, class: 'span-all table-message error-text' },
         'The documents could not be loaded: ' + state.docsError)));
+      rowCache = new Map();
       return;
     }
     if (!state.docs.length) {
-      body.append(h('tr', {}, h('td', { colspan: 9, class: 'table-message' },
-        h('strong', {}, 'No documents yet. '),
-        'Drop files above, or choose files, to build this knowledge base.')));
+      body.replaceChildren(h('tr', {}, h('td', { colspan: span, class: 'span-all table-message' },
+        h('strong', {}, state.docsLoaded ? 'No documents yet. ' : 'Loading the documents. '),
+        state.docsLoaded ? 'Drop files above, choose files or add a folder to build this knowledge base.' : '')));
+      rowCache = new Map();
       return;
     }
+    const nextRows = new Map();
+    const nextDrawers = new Map();
+    const nodes = [];
     for (const doc of state.docs) {
-      body.append(docRow(doc));
-      if (state.expanded.has(doc.id)) body.append(drawerRow(doc));
+      const sig = rowSignature(doc);
+      const cached = rowCache.get(doc.id);
+      const row = cached && cached.sig === sig ? cached.row : docRow(doc);
+      nextRows.set(doc.id, { sig, row });
+      nodes.push(row);
+      if (state.expanded.has(doc.id)) {
+        const key = doc.id + '@' + (doc.indexed_at || '');
+        const drawer = drawerCache.get(key) || drawerRow(doc, span);
+        drawer.firstChild.colSpan = span;
+        nextDrawers.set(key, drawer);
+        nodes.push(drawer);
+      }
     }
+    rowCache = nextRows;
+    drawerCache = nextDrawers;
+    keepFocus(body, () => reconcile(body, nodes));
+  }
+
+  function actionButton(action, label, props) {
+    return h('button', Object.assign({ type: 'button', class: 'btn btn-ghost btn-small', dataset: { action } }, props || {}), label);
   }
 
   function docRow(doc) {
-    const busy = ACTIVE.has(doc.status);
+    const pending = state.pending.get(doc.id) || null;
+    const job = JOB_ACTIVE.has(doc.status) ? activeJobFor(doc.id) : null;
+    const status = job ? jobDisplayStatus(job) : doc.status;
     const expanded = state.expanded.has(doc.id);
-    const titleCell = h('td', { class: 'title-cell' },
+    const label = doc.source_path || doc.filename || '';
+    const indexed = fmtWhen(doc.indexed_at);
+
+    const sub = h('div', { class: 'doc-sub' },
+      label ? h('a', {
+        class: 'doc-file', href: '/api/documents/' + enc(doc.id) + '/file', download: doc.filename || '',
+        title: 'Download the original file', 'aria-label': 'Download ' + label,
+      }, label) : null,
+      doc.media_type ? h('span', {}, fmtType(doc.media_type)) : null,
+      finite(doc.size_bytes) ? h('span', {}, fmtBytes(doc.size_bytes)) : null,
+      doc.pages ? h('span', { class: 'sub-pages' }, plural(doc.pages, 'page')) : null,
+      doc.uploaded_at ? h('span', { class: 'sub-uploaded' }, 'uploaded ' + fmtWhen(doc.uploaded_at).text) : null,
+      doc.indexed_at ? h('span', { class: 'sub-indexed' }, 'indexed ' + indexed.text) : null);
+
+    let progressText = null;
+    if (job) progressText = jobProgressText(job);
+    else if (doc.status === 'queued') progressText = 'Waiting for a free worker';
+    else if (doc.status === 'processing') progressText = 'Processing';
+
+    const titleCell = h('td', { class: 'col-title' },
       h('div', { class: 'doc-title' }, doc.title),
-      doc.filename && doc.filename !== doc.title ? h('div', { class: 'doc-file' }, doc.filename) : null,
-      doc.status === 'failed' ? h('div', { class: 'doc-error' }, doc.error || 'Indexing failed.') : null);
+      sub,
+      progressText ? h('div', { class: 'doc-progress' }, progressText) : null,
+      doc.status === 'failed' ? h('div', { class: 'doc-error' }, doc.error || 'Indexing failed.') : null,
+      doc.status === 'cancelled' ? h('div', { class: 'doc-note' }, doc.error || 'Indexing was cancelled.') : null);
 
-    const passages = h('button', {
-      type: 'button', class: 'btn btn-ghost btn-small',
-      'aria-expanded': String(expanded), 'aria-controls': 'drawer-' + doc.id,
-      disabled: doc.status !== 'ready',
-      onclick: () => toggleDrawer(doc.id),
-    }, expanded ? 'Hide passages' : 'Passages');
-    const download = h('a', {
-      class: 'btn btn-ghost btn-small', href: '/api/documents/' + enc(doc.id) + '/file',
-      download: doc.filename || '', title: 'Download the original file',
-    }, 'Download');
-    const reindex = h('button', {
-      type: 'button', class: 'btn btn-ghost btn-small', disabled: busy,
-      title: 'Parse and embed again from the kept original',
-      onclick: () => reindexDocument(doc, reindex),
-    }, 'Re-index');
-    const remove = armButton(h('button', { type: 'button', class: 'btn btn-danger-ghost btn-small' }), {
-      idle: 'Delete',
-      armed: 'Confirm delete',
-      onConfirm: () => deleteDocument(doc),
-    });
+    const statusCell = h('td', { class: 'col-status' }, chip(status),
+      job && status !== 'queued' ? progressBar(jobPercent(job), 'Indexing progress for ' + doc.title, 'row-progress') : null);
 
-    return h('tr', { dataset: { doc: doc.id } },
-      h('td', {}, chip(doc.status)),
+    const actions = h('div', { class: 'row-actions' });
+    if (pending) {
+      actions.append(pendingView(pending));
+    } else if (doc.status === 'ready') {
+      actions.append(
+        actionButton('passages', expanded ? 'Hide passages' : 'Passages', {
+          'aria-expanded': String(expanded), 'aria-controls': 'drawer-' + doc.id, onclick: () => toggleDrawer(doc.id),
+        }),
+        actionButton('reindex', 'Re-index', {
+          title: 'Parse and embed again from the kept original', onclick: () => reindexDocument(doc),
+        }),
+        deleteButton(doc, 'Delete', 'Confirm delete', 'delete'));
+    } else if (doc.status === 'failed' || doc.status === 'cancelled') {
+      actions.append(
+        actionButton('retry', 'Retry', { title: 'Index it again from the kept original', onclick: () => retryDocument(doc) }),
+        deleteButton(doc, 'Dismiss', 'Confirm dismiss', 'dismiss'));
+    } else {
+      if (job && !job.cancel_requested) {
+        actions.append(actionButton('cancel', 'Cancel', {
+          title: 'Stop indexing this document', onclick: (event) => cancelJob(job.id, event.currentTarget),
+        }));
+      }
+      actions.append(deleteButton(doc, 'Delete', 'Confirm delete', 'delete'));
+    }
+
+    return h('tr', { dataset: { doc: doc.id, key: doc.id } },
+      statusCell,
       titleCell,
-      h('td', {}, fmtType(doc.media_type)),
-      h('td', { class: 'num' }, doc.pages === null || doc.pages === undefined ? '' : String(doc.pages)),
-      h('td', { class: 'num' }, doc.status === 'ready' ? String(doc.chunk_count) : ''),
-      h('td', { class: 'num' }, fmtBytes(doc.size_bytes)),
-      whenCell(doc.uploaded_at),
-      whenCell(doc.indexed_at),
-      h('td', {}, h('div', { class: 'row-actions' }, passages, download, reindex, remove)));
+      h('td', { class: 'col-pages num' }, doc.pages === null || doc.pages === undefined ? '' : String(doc.pages)),
+      h('td', { class: 'col-chunks num' }, doc.status === 'ready' ? String(doc.chunk_count) : ''),
+      whenCell(doc.uploaded_at, 'col-uploaded'),
+      whenCell(doc.indexed_at, 'col-indexed'),
+      h('td', { class: 'col-actions' }, actions));
+  }
+
+  function deleteButton(doc, idle, armed, action) {
+    const button = h('button', { type: 'button', class: 'btn btn-danger-ghost btn-small', dataset: { action } });
+    return armButton(button, {
+      idle,
+      armed,
+      onConfirm: () => withPending(doc, action, () => deleteDocument(doc, action)),
+    });
+  }
+
+  const PENDING_LABELS = { delete: 'Deleting', dismiss: 'Removing', reindex: 'Starting re-index', retry: 'Retrying' };
+
+  function pendingView(pending) {
+    return h('div', { class: 'pending', role: 'status' },
+      spinner(),
+      h('span', {}, PENDING_LABELS[pending.action] || 'Working'),
+      pending.slow ? h('span', { class: 'pending-note' }, 'Still working: a large document takes a few seconds.') : null);
+  }
+
+  /* Shows the row's pending state while `run` works, with a note when it takes longer than two seconds. */
+  async function withPending(doc, action, run) {
+    const entry = { action, slow: false };
+    state.pending.set(doc.id, entry);
+    renderDocs();
+    const timer = window.setTimeout(() => {
+      if (state.pending.get(doc.id) !== entry) return;
+      entry.slow = true;
+      renderDocs();
+    }, PENDING_NOTE_MS);
+    try {
+      return await run();
+    } finally {
+      window.clearTimeout(timer);
+      if (state.pending.get(doc.id) === entry) state.pending.delete(doc.id);
+      renderDocs();
+    }
   }
 
   function toggleDrawer(docId) {
     if (state.expanded.has(docId)) state.expanded.delete(docId);
     else state.expanded.add(docId);
     renderDocs();
-    const button = document.querySelector('tr[data-doc="' + CSS.escape(docId) + '"] [aria-controls]');
+    const button = document.querySelector('tr[data-doc="' + CSS.escape(docId) + '"] [data-action="passages"]');
     if (button) button.focus();
   }
 
@@ -894,17 +1425,18 @@
     return chunkCache.get(key);
   }
 
-  function drawerRow(doc) {
-    const cell = h('td', { colspan: 9 }, h('p', { class: 'muted small' }, 'Loading passages...'));
+  function drawerRow(doc, span) {
+    const cell = h('td', { colspan: span, class: 'span-all' }, h('p', { class: 'muted small' }, 'Loading passages...'));
     const row = h('tr', { class: 'drawer-row', id: 'drawer-' + doc.id }, cell);
     loadChunks(doc.id, doc.indexed_at).then((chunks) => {
       cell.replaceChildren(
-        h('div', { class: 'drawer-head' }, h('strong', {}, plural(chunks.length, 'passage')), ' in reading order'),
+        h('div', { class: 'drawer-head' }, h('strong', {}, plural(chunks.length, 'passage')), ' of ', doc.title, ', in reading order'),
         h('ol', { class: 'passage-list' }, chunks.map((c) => h('li', { class: 'passage' },
           h('div', { class: 'passage-meta' },
             h('span', { class: 'badge badge-muted plain' }, '#' + c.ordinal),
             c.section ? h('span', {}, c.section) : null,
-            c.page !== null && c.page !== undefined ? h('span', {}, 'page ' + c.page) : null,
+            pagesLabel(c.page_start !== null && c.page_start !== undefined ? c.page_start : c.page, c.page_end)
+              ? h('span', {}, pagesLabel(c.page_start !== null && c.page_start !== undefined ? c.page_start : c.page, c.page_end)) : null,
             c.token_estimate ? h('span', {}, 'about ' + c.token_estimate + ' tokens') : null),
           h('p', { class: 'passage-text' }, c.text)))));
     }).catch((e) => {
@@ -913,39 +1445,76 @@
     return row;
   }
 
-  async function reindexDocument(doc, button) {
-    button.disabled = true;
-    try {
-      const job = await api('POST', '/api/documents/' + enc(doc.id) + '/reindex');
-      addUploadItem({
-        name: 'Re-index: ' + doc.title, size: doc.size_bytes, collectionId: doc.collection_id,
-        status: job.status, jobId: job.id, docId: doc.id, progress: 100, kind: 'reindex',
-      });
-      ensureJobPolling();
-      loadDocs();
-    } catch (e) {
-      button.disabled = false;
-      showBannerMessage('Re-index could not start: ' + e.message);
-    }
+  function trackJob(job, base) {
+    const item = Object.assign({ status: 'queued', progress: 100, note: null }, base);
+    applyJob(item, job);
+    addUploadItem(item);
+    ensureJobPolling();
   }
 
-  async function deleteDocument(doc) {
-    try {
-      await api('DELETE', '/api/documents/' + enc(doc.id));
-      state.expanded.delete(doc.id);
-      announce(doc.title + ' deleted.');
+  async function reindexDocument(doc) {
+    await withPending(doc, 'reindex', async () => {
+      try {
+        const job = await api('POST', '/api/documents/' + enc(doc.id) + '/reindex');
+        trackJob(job, { name: 'Re-index: ' + doc.title, size: doc.size_bytes, collectionId: doc.collection_id, kind: 'reindex' });
+        await loadDocs();
+      } catch (e) {
+        showBannerMessage('Re-index could not start: ' + e.message);
+      }
+    });
+  }
+
+  async function retryDocument(doc) {
+    await withPending(doc, 'retry', async () => {
+      let job = null;
+      try {
+        job = await api('POST', '/api/documents/' + enc(doc.id) + '/retry');
+      } catch (e) {
+        if (e.status !== 409) {
+          showBannerMessage('Retry could not start: ' + e.message);
+          return;
+        }
+        // Retry is for failed rows only; a cancelled row answers 409, and re-indexing it from the kept
+        // original does the same thing.
+        try {
+          job = await api('POST', '/api/documents/' + enc(doc.id) + '/reindex');
+        } catch (err) {
+          showBannerMessage('Retry could not start: ' + err.message);
+          return;
+        }
+      }
+      if (job && job.id) {
+        trackJob(job, { name: 'Retry: ' + (doc.source_path || doc.filename || doc.title), size: doc.size_bytes, collectionId: doc.collection_id, kind: 'retry' });
+      }
       await loadDocs();
+    });
+  }
+
+  async function deleteDocument(doc, action) {
+    try {
+      const result = await api('DELETE', '/api/documents/' + enc(doc.id));
+      state.expanded.delete(doc.id);
+      state.docs = state.docs.filter((d) => d.id !== doc.id);
+      if (result && result.pending) {
+        // 202: the delete goes on in the background; the list catches up on a later refresh.
+        announce(doc.title + ': ' + result.message);
+        scheduleDocs(DOCS_POLL_MS * 2);
+      } else {
+        announce(doc.title + (action === 'dismiss' ? ' dismissed.' : ' deleted.'));
+        await loadDocs();
+      }
       loadHealth();
     } catch (e) {
-      showBannerMessage('The document could not be deleted: ' + e.message);
+      showBannerMessage('The document could not be ' + (action === 'dismiss' ? 'dismissed: ' : 'deleted: ') + e.message);
     }
   }
 
-  // ------------------------------------------------------------------ uploads
+  // ------------------------------------------------------------------ uploads: files, folders, zips
 
   function setupUploads() {
     const zone = $('dropzone');
     const input = $('file-input');
+    const folder = $('folder-input');
     zone.addEventListener('click', () => { if (state.current) input.click(); });
     zone.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
@@ -953,9 +1522,14 @@
         if (state.current) input.click();
       }
     });
+    $('add-folder').addEventListener('click', () => { if (state.current) folder.click(); });
     input.addEventListener('change', () => {
-      handleFiles(Array.from(input.files || []));
+      handleFiles(Array.from(input.files || []).map((file) => ({ file, path: '' })), false);
       input.value = '';
+    });
+    folder.addEventListener('change', () => {
+      handleFiles(Array.from(folder.files || []).map((file) => ({ file, path: file.webkitRelativePath || '' })), true);
+      folder.value = '';
     });
     let depth = 0;
     zone.addEventListener('dragenter', (event) => { event.preventDefault(); depth += 1; zone.classList.add('dragging'); });
@@ -965,7 +1539,7 @@
       event.preventDefault();
       depth = 0;
       zone.classList.remove('dragging');
-      handleFiles(Array.from((event.dataTransfer && event.dataTransfer.files) || []));
+      filesFromDrop(event.dataTransfer).then(({ entries, folder: fromFolder }) => handleFiles(entries, fromFolder));
     });
     // A file dropped next to the zone must not replace the page.
     window.addEventListener('dragover', (event) => event.preventDefault());
@@ -976,37 +1550,87 @@
     });
   }
 
-  function handleFiles(files) {
-    if (!state.current || !files.length) return;
+  /* Files and folders from a drop. Folders are walked, and each file keeps its path inside the folder. The entries
+   * are taken before the first await: the browser empties the drop data when the event handler returns. */
+  function filesFromDrop(dataTransfer) {
+    const items = Array.from((dataTransfer && dataTransfer.items) || []);
+    const entries = items.map((item) => (item.kind === 'file' && item.webkitGetAsEntry ? item.webkitGetAsEntry() : null));
+    if (!entries.some((entry) => entry && entry.isDirectory)) {
+      const files = Array.from((dataTransfer && dataTransfer.files) || []).map((file) => ({ file, path: '' }));
+      return Promise.resolve({ entries: files, folder: false });
+    }
+    const loose = items.map((item, i) => (entries[i] ? null : item.getAsFile()));
+    const out = [];
+    const walk = async (entry) => {
+      if (entry.isFile) {
+        const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+        if (file) out.push({ file, path: String(entry.fullPath || file.name).replace(/^\/+/, '') });
+        return;
+      }
+      if (!entry.isDirectory) return;
+      const reader = entry.createReader();
+      for (;;) {
+        const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+        if (!batch.length) break;
+        for (const child of batch) await walk(child);
+      }
+    };
+    return (async () => {
+      for (const entry of entries) if (entry) await walk(entry);
+      for (const file of loose) if (file) out.push({ file, path: '' });
+      return { entries: out, folder: true };
+    })();
+  }
+
+  function handleFiles(entries, fromFolder) {
+    if (!state.current || !entries.length) return;
     const health = state.health || {};
-    const maxBytes = (health.max_upload_mb || 50) * 1024 * 1024;
-    const types = new Set(health.supported_types || []);
+    const limitMb = health.max_upload_mb || 50;
+    const maxBytes = limitMb * 1024 * 1024;
+    const types = acceptedTypes();
     const titleInput = $('upload-title');
     const title = titleInput.value.trim();
-    const valid = files.filter((f) => (!types.size || types.has(suffixOf(f.name))) && f.size <= maxBytes && f.size > 0);
-    const useTitle = title && files.length === 1 && valid.length === 1;
-    let titleNote = title && files.length > 1 ? 'The title was not used because several files were chosen.' : null;
+    let skipped = 0;
+    const chosen = [];
+    for (const entry of entries) {
+      const name = entry.file.name;
+      // A folder holds files nobody meant to upload (pictures, hidden system files): leave them out quietly.
+      if (fromFolder && (name.startsWith('.') || (types.size && !types.has(suffixOf(name))))) {
+        skipped += 1;
+        continue;
+      }
+      chosen.push(entry);
+    }
+    const single = chosen.length === 1 && !fromFolder && suffixOf(chosen[0].file.name) !== ARCHIVE;
+    const useTitle = Boolean(title) && single;
+    let titleNote = title && !useTitle ? 'The title was not used: it applies to one file only, not to several files, a folder or a zip.' : null;
     if (titleNote) announce(titleNote);
-    for (const file of files) {
+    for (const entry of chosen) {
+      const file = entry.file;
+      const suffix = suffixOf(file.name);
       const item = {
-        name: file.name, size: file.size, collectionId: state.current, file,
+        name: entry.path || file.name, path: entry.path || '', size: file.size, collectionId: state.current, file,
         status: 'waiting', progress: 0, kind: 'upload', title: useTitle ? title : null, note: titleNote,
+        archive: suffix === ARCHIVE,
       };
       titleNote = null;
-      if (types.size && !types.has(suffixOf(file.name))) {
-        item.status = 'failed';
-        item.note = 'This file type (' + (suffixOf(file.name) || 'no extension') + ') is not supported.';
-      } else if (file.size > maxBytes) {
-        item.status = 'failed';
-        item.note = 'Larger than the ' + (health.max_upload_mb || 50) + ' MB limit per file.';
-      } else if (file.size === 0) {
-        item.status = 'failed';
-        item.note = 'The file is empty.';
+      let reason = null;
+      if (types.size && !types.has(suffix)) reason = 'this file type (' + (suffix || 'no extension') + ') is not supported.';
+      else if (file.size > maxBytes && suffix !== ARCHIVE) reason = 'larger than the ' + limitMb + ' MB limit per file.';
+      else if (file.size === 0) reason = 'the file is empty.';
+      if (reason) {
+        item.status = 'rejected';
+        item.note = 'Rejected: ' + reason;
+        item.file = null;
       }
       addUploadItem(item);
-      if (item.status === 'waiting') {
-        uploadQueue.push(item);
-      }
+      if (item.status === 'waiting') uploadQueue.push(item);
+    }
+    if (skipped) {
+      addUploadItem({
+        name: plural(skipped, 'file') + ' left out of the folder', size: null, collectionId: state.current,
+        status: 'skipped', kind: 'note', note: 'Hidden files and file types rag-kb cannot read are not uploaded.',
+      });
     }
     if (useTitle) titleInput.value = '';
     pumpUploads();
@@ -1022,6 +1646,7 @@
   function pumpUploads() {
     while (activeUploads < 2 && uploadQueue.length) {
       const item = uploadQueue.shift();
+      if (item.status !== 'waiting') continue;
       activeUploads += 1;
       runUpload(item).finally(() => {
         activeUploads -= 1;
@@ -1033,9 +1658,12 @@
   function xhrUpload(item) {
     return new Promise((resolve) => {
       const form = new FormData();
-      form.append('files', item.file, item.name);
+      form.append('files', item.file, item.file.name);
+      // The path inside a folder or zip is the document's identity; a plain file is known by its name.
+      if (item.path) form.append('relative_paths', item.path);
       if (item.title) form.append('title', item.title);
       const xhr = new XMLHttpRequest();
+      item.xhr = xhr;
       xhr.open('POST', '/api/collections/' + enc(item.collectionId) + '/documents');
       xhr.setRequestHeader('Accept', 'application/json');
       xhr.upload.addEventListener('progress', (event) => {
@@ -1050,8 +1678,17 @@
         resolve({ status: xhr.status, data });
       });
       xhr.addEventListener('error', () => resolve({ status: 0, data: null }));
+      xhr.addEventListener('abort', () => resolve({ status: -1, data: null }));
       xhr.send(form);
     });
+  }
+
+  /* The 202 upload response: `jobs` (one Job per accepted file; a zip gives one per file inside it),
+   * `rejected` (one {filename, source_path, code, message} per file refused up front, which left no row) and
+   * `skipped` (zip entries left out on purpose: folders and hidden files). Each file is in exactly one list. */
+  function uploadEntries(data) {
+    if (!data || !Array.isArray(data.jobs)) return [];
+    return data.jobs.map((job) => ({ job })).concat((data.rejected || []).map((rejected) => ({ rejected })));
   }
 
   async function runUpload(item) {
@@ -1059,34 +1696,109 @@
     renderUploads();
     const { status, data } = await xhrUpload(item);
     item.file = null;
-    const job = data && Array.isArray(data.jobs) ? data.jobs[0] : null;
-    if (status === 202 && job) {
-      item.jobId = job.id;
-      item.docId = job.doc_id || null;
-      item.progress = 100;
-      if (job.already_indexed) {
-        item.status = 'known';
-        item.note = 'Same content as a document already in this collection, so it was kept once.';
-        if (item.collectionId === state.current) loadDocs();
-      } else {
-        item.status = job.status;
-        ensureJobPolling();
-      }
+    item.xhr = null;
+    if (status === -1) {
+      item.status = 'cancelled';
+      item.note = 'Upload cancelled before it reached the server.';
+      renderUploads();
+      return;
+    }
+    const entries = status === 202 ? uploadEntries(data) : [];
+    if (entries.length) {
+      applyUploadEntries(item, entries, Number(data.skipped) || 0);
+    } else if (data && data.error) {
+      item.status = 'rejected';
+      item.note = 'Rejected: ' + (data.error.message || 'the server did not accept this file.');
     } else {
       item.status = 'failed';
-      item.note = data && data.error ? data.error.message
-        : (status === 0 ? 'The upload did not reach the server.' : 'The upload failed with status ' + status + '.');
+      item.note = status === 0 ? 'The upload did not reach the server.' : 'The upload failed with status ' + status + '.';
     }
     renderUploads();
+    if (state.uploads.some((u) => u.jobId && TRACKED.has(u.status))) ensureJobPolling();
+    if (item.collectionId === state.current) scheduleDocs(300);
+  }
+
+  function entryName(entry) {
+    const source = entry.job || entry.rejected;
+    return source.source_path || source.filename;
+  }
+
+  function applyUploadEntries(item, entries, skipped) {
+    if (entries.length === 1 && !item.archive) {
+      applyEntry(item, entries[0]);
+      return;
+    }
+    // A zip: the archive's row stays as a header, followed by one row per file inside it.
+    const children = entries.map((entry) => {
+      const child = {
+        name: entryName(entry), size: entry.job && finite(entry.job.bytes_total) ? entry.job.bytes_total : null,
+        collectionId: item.collectionId, status: 'queued', progress: 100, kind: 'upload', note: null,
+      };
+      applyEntry(child, entry);
+      uploadSeq += 1;
+      child.key = uploadSeq;
+      return child;
+    });
+    const rejected = children.filter((c) => c.status === 'rejected').length;
+    item.status = 'unpacked';
+    item.progress = 100;
+    item.note = 'Unpacked into ' + plural(children.length - rejected, 'file') + (rejected ? '; ' + rejected + ' rejected' : '')
+      + (skipped ? '; ' + plural(skipped, 'entry', 'entries') + ' left out (folders and hidden files)' : '') + '.';
+    state.uploads.splice(state.uploads.indexOf(item) + 1, 0, ...children);
+  }
+
+  function applyEntry(item, entry) {
+    if (entry.rejected) {
+      item.status = 'rejected';
+      item.note = 'Rejected: ' + entry.rejected.message;
+      return;
+    }
+    applyJob(item, entry.job);
+  }
+
+  function jobNote(item, job) {
+    const status = jobDisplayStatus(job);
+    const replaced = job.replaced_title ? '"' + job.replaced_title + '"' : null;
+    if (status === 'failed') return (job.error || 'Indexing failed.') + (replaced ? ' ' + replaced + ' was kept as it was.' : '');
+    if (status === 'cancelled') return 'Cancelled.' + (replaced ? ' ' + replaced + ' was kept as it was.' : '');
+    if (status === 'ready') {
+      if (replaced) return 'Replaced ' + replaced + '.';
+      if (item.kind === 'reindex') return 'Re-indexed.';
+      if (item.kind === 'retry') return 'Indexed on retry.';
+      return 'Indexed and searchable.';
+    }
+    const progress = jobProgressText(job);
+    return replaced ? progress + '. Replaces ' + replaced + ' once indexed.' : progress;
+  }
+
+  /* Updates an upload row from its job. Returns true when what the row shows has changed. */
+  function applyJob(item, job) {
+    if (!job || typeof job !== 'object') return false;
+    if (job.id) {
+      item.jobId = job.id;
+      jobCache.set(job.id, job);
+    }
+    item.job = job;
+    if (job.doc_id) item.docId = job.doc_id;
+    item.progress = 100;
+    const before = item.status + '|' + item.note + '|' + jobSignature(job);
+    if (job.already_indexed) {
+      item.status = 'known';
+      item.note = 'Same content as a document already in this collection, so it was kept once.';
+    } else {
+      item.status = jobDisplayStatus(job);
+      item.note = jobNote(item, job);
+    }
+    return before !== item.status + '|' + item.note + '|' + jobSignature(item.job);
   }
 
   function ensureJobPolling() {
-    if (!jobTimer) jobTimer = window.setInterval(pollJobs, 1000);
+    if (!jobTimer) jobTimer = window.setInterval(pollJobs, JOB_POLL_MS);
   }
 
   async function pollJobs() {
     if (jobBusy) return;
-    const active = state.uploads.filter((u) => u.jobId && (u.status === 'queued' || u.status === 'processing'));
+    const active = state.uploads.filter((u) => u.jobId && TRACKED.has(u.status));
     if (!active.length) {
       window.clearInterval(jobTimer);
       jobTimer = null;
@@ -1094,34 +1806,48 @@
     }
     jobBusy = true;
     let changed = false;
+    const finished = [];
     try {
-      await Promise.all(active.map(async (item) => {
-        try {
-          const job = await api('GET', '/api/jobs/' + enc(item.jobId));
-          if (job.doc_id) item.docId = job.doc_id;
-          if (job.status !== item.status) {
-            item.status = job.status;
-            changed = true;
-            if (job.status === 'failed') item.note = job.error || 'Indexing failed.';
-            if (job.status === 'ready') {
-              item.note = item.kind === 'reindex' ? 'Re-indexed.' : 'Indexed and searchable.';
-              announce(item.name + ' is ready.');
-            }
+      const byCollection = new Map();
+      for (const item of active) {
+        if (!byCollection.has(item.collectionId)) byCollection.set(item.collectionId, []);
+        byCollection.get(item.collectionId).push(item);
+      }
+      for (const [cid, items] of byCollection) {
+        const listed = await refreshJobs(cid);
+        const seen = new Set(Array.isArray(listed) ? listed.map((j) => j.id) : []);
+        const gone = new Set();
+        // Jobs the list did not include (an older server, or a very long queue): ask for a few one by one.
+        await Promise.all(items.filter((i) => !seen.has(i.jobId)).slice(0, 8).map(async (item) => {
+          try {
+            jobCache.set(item.jobId, await api('GET', '/api/jobs/' + enc(item.jobId)));
+          } catch (e) {
+            if (e.status === 404) gone.add(item);
           }
-        } catch (e) {
-          if (e.status === 404) {
+        }));
+        for (const item of items) {
+          if (gone.has(item)) {
             item.status = 'failed';
             item.note = 'The server no longer knows this job.';
             changed = true;
+            finished.push(item);
+            continue;
           }
+          const job = jobCache.get(item.jobId);
+          if (!job) continue;
+          if (applyJob(item, job)) changed = true;
+          if (!TRACKED.has(item.status)) finished.push(item);
         }
-      }));
+      }
     } finally {
       jobBusy = false;
     }
-    if (changed) {
-      renderUploads();
-      loadDocs();
+    if (changed) renderUploads();
+    const ready = finished.filter((i) => i.status === 'ready');
+    if (ready.length === 1) announce(ready[0].name + ' is ready.');
+    else if (ready.length > 1) announce(ready.length + ' documents are ready.');
+    if (finished.length) {
+      scheduleDocs(0);
       loadHealth();
     }
   }
@@ -1135,21 +1861,83 @@
     });
   }
 
+  function itemPercent(item) {
+    if (item.status === 'waiting') return 0;
+    // An upload's bar covers the transfer (the first 30%) and then the indexing; a re-index only the indexing.
+    const scale = (p) => (item.kind === 'upload' ? Math.round(30 + 0.7 * p) : p);
+    if (item.status === 'uploading') return item.kind === 'upload' ? Math.round(0.3 * (item.progress || 0)) : 0;
+    if (item.status === 'queued') return scale(0);
+    if (item.status === 'processing' || item.status === 'cancelling') {
+      const p = item.job ? jobPercent(item.job) : null;
+      return p === null ? null : scale(p);
+    }
+    return 100;
+  }
+
+  function cancellable(item) {
+    if (item.status === 'waiting' || item.status === 'uploading') return true;
+    return Boolean(item.jobId) && (item.status === 'queued' || item.status === 'processing');
+  }
+
+  async function cancelUpload(item, button) {
+    if (item.status === 'waiting') {
+      const at = uploadQueue.indexOf(item);
+      if (at >= 0) uploadQueue.splice(at, 1);
+      item.status = 'cancelled';
+      item.note = 'Not uploaded.';
+      item.file = null;
+      renderUploads();
+      return;
+    }
+    if (item.status === 'uploading' && item.xhr) {
+      item.xhr.abort();
+      return;
+    }
+    if (item.jobId) await cancelJob(item.jobId, button);
+  }
+
+  function uploadRow(item) {
+    const percent = itemPercent(item);
+    const failed = item.status === 'failed' || item.status === 'rejected';
+    let note = item.note;
+    if (!note && item.status === 'waiting') note = 'Waiting to upload';
+    else if (!note && item.status === 'uploading') note = 'Uploading, ' + (item.progress || 0) + '%';
+    return h('li', { class: 'upload-item', dataset: { key: 'u' + item.key, status: item.status } },
+      h('span', { class: 'upload-name', title: item.name }, item.name,
+        finite(item.size) ? h('span', { class: 'muted small' }, '  ' + fmtBytes(item.size)) : null),
+      // A bar while the file moves, and a full one once it is ready; a rejected or cancelled row has none.
+      BAR_STATES.has(item.status) ? progressBar(percent, 'Progress for ' + item.name) : h('span'),
+      chip(item.status),
+      cancellable(item)
+        ? h('button', {
+          type: 'button', class: 'btn btn-ghost btn-small', dataset: { action: 'cancel' }, 'aria-label': 'Cancel ' + item.name,
+          onclick: (event) => cancelUpload(item, event.currentTarget),
+        }, 'Cancel')
+        : h('span'),
+      note ? h('span', { class: 'upload-note' + (failed ? ' error-text' : '') }, note) : null);
+  }
+
   function renderUploads() {
     const items = state.uploads.filter((u) => u.collectionId === state.current);
     $('upload-panel').hidden = !items.length;
     const list = $('upload-list');
-    list.replaceChildren();
-    for (const item of items) {
-      const progress = h('progress', { max: '100', 'aria-label': 'Upload progress for ' + item.name });
-      if (item.status === 'uploading' || item.status === 'waiting') progress.value = item.progress || 0;
-      else progress.value = 100;
-      list.append(h('li', { class: 'upload-item' },
-        h('span', { class: 'upload-name', title: item.name }, item.name, h('span', { class: 'muted small' }, '  ' + fmtBytes(item.size))),
-        progress,
-        chip(item.status),
-        item.note ? h('span', { class: 'upload-note' + (item.status === 'failed' ? ' error-text' : '') }, item.note) : null));
-    }
+    const next = new Map();
+    const nodes = items.map((item) => {
+      const sig = [item.status, item.note, itemPercent(item), item.name, item.size, cancellable(item)].join('|');
+      const cached = uploadRowCache.get(item.key);
+      const node = cached && cached.sig === sig ? cached.node : uploadRow(item);
+      next.set(item.key, { sig, node });
+      return node;
+    });
+    uploadRowCache = next;
+    keepFocus(list, () => reconcile(list, nodes));
+    const files = items.filter((u) => u.kind !== 'note' && u.status !== 'unpacked');
+    const moving = files.filter((u) => ACTIVE.has(u.status)).length;
+    const problems = files.filter((u) => u.status === 'failed' || u.status === 'rejected').length;
+    const parts = [plural(files.length, 'file')];
+    if (moving) parts.push(moving + ' in progress');
+    if (problems) parts.push(problems + ' with problems');
+    $('upload-count').textContent = files.length ? '(' + parts.join(', ') + ')' : '';
   }
 
   // ------------------------------------------------------------------ ask
@@ -1167,16 +1955,18 @@
     box.replaceChildren();
     const ready = state.docs.filter((d) => d.status === 'ready');
     if (!ready.length) return;
-    const pick = (text, probe) => h('button', {
-      type: 'button', class: 'suggestion' + (probe ? ' probe' : ''),
-      title: probe ? 'A question the documents should not cover: a good knowledge base says so instead of guessing.' : text,
-      onclick: () => {
-        $('question').value = text;
-        $('question').focus();
-      },
-    }, probe ? text + ' (out of scope test)' : text);
-    for (const doc of ready.slice(0, 2)) box.append(pick('What does "' + doc.title + '" cover?', false));
-    box.append(pick(OUT_OF_SCOPE_PROBE, true));
+    const fill = (text) => () => {
+      $('question').value = text;
+      $('question').focus();
+    };
+    for (const doc of ready.slice(0, 2)) {
+      const text = 'What does "' + doc.title + '" cover?';
+      box.append(h('button', { type: 'button', class: 'suggestion', onclick: fill(text) }, text));
+    }
+    // The accessible name is the visible text; the explanation is the description.
+    box.append(h('button', {
+      type: 'button', class: 'suggestion probe', 'aria-describedby': 'probe-hint', onclick: fill(OUT_OF_SCOPE_PROBE),
+    }, OUT_OF_SCOPE_PROBE, ' ', h('span', { class: 'probe-tag' }, '(out of scope test)')));
   }
 
   function setupAsk() {
@@ -1220,6 +2010,7 @@
 
   function clearAnswer() {
     state.answerToken += 1;
+    state.answerId = null;
     const area = $('answer-area');
     if (area) area.replaceChildren();
   }
@@ -1232,8 +2023,8 @@
     }
     const cid = state.current;
     const provider = $('provider-select').value || 'auto';
-    const modelField = $('model-field');
-    const model = !modelField.hidden ? $('model-select').value : '';
+    const modelSelect = $('model-select');
+    const model = modelSelect.disabled ? '' : modelSelect.value;
     const topK = Math.max(1, Math.min(20, Number($('topk-input').value) || 6));
     const body = { question, top_k: topK };
     if (provider !== 'auto') body.provider = provider;
@@ -1262,7 +2053,10 @@
       if (token !== state.answerToken) return;
       const elapsed = performance.now() - started;
       area.replaceChildren(renderAnswer(answer, { elapsedMs: elapsed, request: body }));
-      history.replaceState(null, '', '#ask/' + enc(answer.id));
+      if (answer.id) {
+        state.answerId = answer.id;
+        setRoute('#/answer/' + enc(answer.id), 'push');
+      }
       announce(answer.status === 'answered' ? 'Answer ready.' : 'No answer: ' + (answer.message || answer.status));
     } catch (e) {
       if (token !== state.answerToken) return;
@@ -1278,22 +2072,35 @@
     }
   }
 
-  async function loadStoredAnswer(id) {
+  async function loadStoredAnswer(id, route) {
+    selectTab('ask', { route: 'none' });
+    if (state.answerId === id && $('answer-area').firstChild) {
+      setRoute('#/answer/' + enc(id), route);
+      return;
+    }
+    const token = ++state.answerToken;
+    $('answer-area').replaceChildren(h('article', { class: 'answer-card state-card state-loading', 'aria-busy': 'true' },
+      h('div', { class: 'state-head' }, spinner(), h('h3', {}, 'Opening the stored answer'))));
     try {
       const answer = await api('GET', '/api/answers/' + enc(id));
+      if (token !== state.answerToken) return;
       if (answer.collection_id !== state.current && state.collections.some((c) => c.id === answer.collection_id)) {
-        await selectCollection(answer.collection_id, false);
+        await selectCollection(answer.collection_id, false, 'none');
       }
       $('question').value = answer.question;
       $('answer-area').replaceChildren(renderAnswer(answer, {}));
+      state.answerId = answer.id;
+      setRoute('#/answer/' + enc(answer.id), route);
     } catch (e) {
+      if (token !== state.answerToken) return;
       $('answer-area').replaceChildren(errorCard('That answer could not be loaded', e.message));
+      setRoute('#/answer/' + enc(id), route);
     }
   }
 
   function pseudoAnswer(question, cid, status, message) {
     return {
-      id: '', question, collection_id: cid, status, answer: null, message, citations: [],
+      id: '', question, collection_id: cid, status, answer: null, message, citations: [], closest: [],
       passages_considered: 0, provider: null, knowledge_version: '', language: null, created_at: new Date().toISOString(),
     };
   }
@@ -1316,9 +2123,11 @@
     if (status === 'no_answer') {
       const checked = answer.passages_considered
         ? ' ' + plural(answer.passages_considered, 'passage') + ' were checked and none answers it.' : '';
+      const closest = Array.isArray(answer.closest) && answer.closest.length
+        ? ' The closest passages are below, so you can judge for yourself.' : '';
       return {
         tone: 'warn', icon: '?', title: 'Not covered by these documents', message,
-        hint: 'The knowledge base does not guess.' + checked + ' Try other words, or upload a document that covers it.',
+        hint: 'The knowledge base does not guess.' + checked + closest + ' Try other words, or upload a document that covers it.',
       };
     }
     if (status === 'no_documents') {
@@ -1392,7 +2201,12 @@
     if (answer.language) meta.push('language ' + answer.language);
     if (meta.length) card.append(h('div', { class: 'answer-meta' }, meta.map((m) => h('span', {}, m))));
 
-    if (answer.citations && answer.citations.length) card.append(renderSources(answer.citations, prefix, opts.preview));
+    if (answer.citations && answer.citations.length) {
+      card.append(renderSources(answer.citations, { prefix, preview: opts.preview }));
+    }
+    if (!answered && answer.status === 'no_answer' && Array.isArray(answer.closest) && answer.closest.length) {
+      card.append(renderSources(answer.closest, { prefix: prefix + 'closest-', preview: opts.preview, closest: true }));
+    }
     if (!opts.preview && answer.id) {
       if (answered || answer.status === 'no_answer') card.append(renderFeedback(answer));
       card.append(renderRaw(answer, opts.request));
@@ -1400,36 +2214,70 @@
     return card;
   }
 
-  function renderSources(citations, prefix, preview) {
-    const top = Math.max(...citations.map((c) => (typeof c.score === 'number' ? c.score : 0)), 0);
+  function renderSources(citations, options) {
+    const opts = options || {};
     const list = h('ol', { class: 'source-list' });
-    for (const c of citations) {
-      const where = [];
-      if (c.page !== null && c.page !== undefined) where.push('page ' + c.page);
-      if (c.section) where.push(c.section);
-      const fill = h('span', { class: 'scorebar-fill' });
-      const ratio = top > 0 && typeof c.score === 'number' ? Math.max(0.04, c.score / top) : 0;
-      fill.style.width = Math.round(ratio * 100) + '%';
-      const passage = h('div', { class: 'source-passage', hidden: true });
-      const open = preview ? null : h('button', {
-        type: 'button', class: 'btn btn-ghost btn-small', 'aria-expanded': 'false',
-        onclick: () => togglePassage(c, passage, open),
-      }, 'Open passage');
-      list.append(h('li', { class: 'source-card', id: prefix + 'source-' + c.marker, tabindex: '-1' },
-        h('div', { class: 'source-head' },
-          h('span', { class: 'cite-badge' }, String(c.marker)),
-          h('span', { class: 'source-title' }, c.title),
-          where.length ? h('span', { class: 'muted small' }, where.join('  |  ')) : null),
-        c.snippet ? h('p', { class: 'snippet' }, c.snippet) : null,
-        h('div', { class: 'source-foot' },
-          h('span', { class: 'scorebar', role: 'img', 'aria-label': 'Relative score ' + Math.round(ratio * 100) + ' percent' }, fill),
-          h('span', { class: 'muted small' }, 'score ' + fmtScore(c.score)),
-          open),
-        passage));
+    for (const c of citations) list.append(sourceCard(c, opts.prefix || '', opts.preview));
+    if (opts.closest) {
+      return h('section', { class: 'sources closest-passages', 'aria-label': 'Closest passages' },
+        h('h3', {}, 'Closest passages'),
+        h('p', { class: 'muted small' }, 'None of these answers the question. They are the nearest passages that were found, shown so you can judge for yourself.'),
+        list);
     }
     return h('section', { class: 'sources', 'aria-label': 'Sources' },
       h('h3', {}, 'Sources'), list,
-      h('p', { class: 'muted small' }, 'Bars are relative to the strongest source in this answer. See Help for how to read the scores.'));
+      h('p', { class: 'muted small' }, 'Similarity (the bar) says how close each passage is in meaning to the question, from 0 to 1. The rank score sets the order. See Help for how to read the scores.'));
+  }
+
+  function sourceCard(c, prefix, preview) {
+    const where = [];
+    const pages = pagesLabel(c.page, c.page_end);
+    if (pages) where.push(pages);
+    if (c.section) where.push(c.section);
+    const passage = h('div', { class: 'source-passage', hidden: true });
+    const open = preview ? null : h('button', {
+      type: 'button', class: 'btn btn-ghost btn-small', 'aria-expanded': 'false',
+      onclick: () => togglePassage(c, passage, open),
+    }, 'Open passage');
+    return h('li', { class: 'source-card', id: prefix + 'source-' + c.marker, tabindex: '-1' },
+      h('div', { class: 'source-head' },
+        h('span', { class: 'cite-badge' }, String(c.marker)),
+        h('span', { class: 'source-title' }, c.title),
+        where.length ? h('span', { class: 'muted small' }, where.join('  |  ')) : null),
+      c.snippet ? h('p', { class: 'snippet' }, c.snippet) : null,
+      h('div', { class: 'source-foot' }, scoreView(c), open),
+      passage);
+  }
+
+  /* The similarity bar is absolute (the raw cosine, 0 to 1), so a full bar means a close match in any answer.
+   * The reranker score, when a reranker ran, says how relevant the passage is; the fused rank score only orders. */
+  function scoreView(c) {
+    const parts = [];
+    const cosine = finite(c.vector_score) ? c.vector_score : null;
+    const fill = h('span', { class: 'scorebar-fill' });
+    const share = cosine === null ? 0 : Math.max(0, Math.min(1, cosine));
+    fill.style.width = (cosine === null ? 0 : Math.max(2, Math.round(share * 100))) + '%';
+    parts.push(h('span', {
+      class: 'scorebar' + (cosine === null ? ' scorebar-none' : ''), role: 'img',
+      'aria-label': cosine === null ? 'No similarity score' : 'Similarity ' + fmtRelevance(cosine) + ' on a scale from 0 to 1',
+    }, fill));
+    parts.push(h('span', {
+      class: 'score',
+      title: cosine === null
+        ? 'This passage was found by the word search alone, so it has no meaning score.'
+        : 'Cosine similarity between the meaning of the question and of the passage, from 0 to 1. Higher is closer.',
+    }, cosine === null ? 'no similarity score' : 'similarity ' + fmtRelevance(cosine)));
+    if (finite(c.rerank_score)) {
+      parts.push(h('span', {
+        class: 'score', title: 'Relevance from the local reranker, which reads the question and the passage together. Higher is more relevant.',
+      }, 'reranker ' + fmtRelevance(c.rerank_score)));
+    }
+    if (finite(c.score)) {
+      parts.push(h('span', {
+        class: 'score muted', title: 'Rank fusion score: it sets the order of the sources. It is not a measure of relevance.',
+      }, 'rank ' + fmtScore(c.score)));
+    }
+    return h('span', { class: 'score-group' }, parts);
   }
 
   async function togglePassage(citation, box, button) {
@@ -1511,7 +2359,7 @@
       send.disabled = true;
       try {
         await api('POST', '/api/answers/' + enc(answer.id) + '/feedback', { rating, note: note.value.trim() });
-        result.textContent = 'Thanks, your feedback was saved.';
+        result.textContent = 'Thanks, your feedback was saved. Curators see it on the Settings tab.';
         note.hidden = true;
         send.hidden = true;
       } catch (e) {
@@ -1527,8 +2375,79 @@
     return box;
   }
 
-  function shellQuote(text) {
-    return "'" + String(text).replace(/'/g, "'\\''") + "'";
+  // ------------------------------------------------------------------ the same request from a terminal
+
+  // Letters, digits and punctuation that no supported shell treats specially inside its quotes.
+  const SAFE_CHAR = /^[A-Za-z0-9 .,:;?@#()*+=_/-]$/;
+
+  /* A JSON string in which every other character is a JSON escape, so the text is plain ASCII and contains no
+   * quote, backslash, dollar, percent or caret that bash, PowerShell or cmd would interpret. */
+  function shellSafeString(text) {
+    let out = '"';
+    for (const ch of String(text)) {
+      if (SAFE_CHAR.test(ch)) {
+        out += ch;
+        continue;
+      }
+      for (let i = 0; i < ch.length; i += 1) out += BACKSLASH + 'u' + ch.charCodeAt(i).toString(16).padStart(4, '0');
+    }
+    return out + '"';
+  }
+
+  function shellSafeJson(value) {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value === 'number') return Number.isFinite(value) ? String(value) : 'null';
+    if (typeof value === 'boolean') return String(value);
+    if (typeof value === 'string') return shellSafeString(value);
+    if (Array.isArray(value)) return '[' + value.map(shellSafeJson).join(',') + ']';
+    return '{' + Object.entries(value)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => shellSafeString(k) + ':' + shellSafeJson(v)).join(',') + '}';
+  }
+
+  function shellCommand(shell, url, body) {
+    const json = shellSafeJson(body);
+    const safeUrl = url.replace(/'/g, '%27').replace(/"/g, '%22');
+    if (shell === 'powershell') {
+      // Invoke-RestMethod, because curl is an alias with other options in Windows PowerShell 5.1.
+      return "Invoke-RestMethod -Method Post -Uri '" + safeUrl + "' -ContentType 'application/json' -Body '" + json
+        + "' | ConvertTo-Json -Depth 8";
+    }
+    if (shell === 'cmd') {
+      // curl.exe ships with Windows 10 and later; inside double quotes a quote is written as a backslash and a quote.
+      return 'curl -s -X POST "' + safeUrl + '" -H "Content-Type: application/json" -d "' + json.replace(/"/g, BACKSLASH + '"') + '"';
+    }
+    return "curl -s -X POST '" + safeUrl + "' -H 'Content-Type: application/json' -d '" + json + "'";
+  }
+
+  function defaultShell() {
+    const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '';
+    return /win/i.test(platform) ? 'powershell' : 'bash';
+  }
+
+  /* A bash, PowerShell or cmd version of a request, with a switch this browser remembers. */
+  function shellSnippet(url, body) {
+    shellSeq += 1;
+    const group = 'shell-' + shellSeq;
+    const saved = recall('shell', '');
+    let current = SHELLS.some(([value]) => value === saved) ? saved : defaultShell();
+    const code = h('div', { class: 'shell-code' });
+    const paint = () => code.replaceChildren(codeBlock(shellCommand(current, url, body), 'Copy'));
+    const switcher = h('div', { class: 'segmented shell-switch', role: 'radiogroup', 'aria-label': 'Shell' });
+    for (const [value, label] of SHELLS) {
+      const id = group + '-' + value;
+      const input = h('input', { type: 'radio', name: group, id, value, autocomplete: 'off' });
+      input.checked = value === current;
+      input.addEventListener('change', () => {
+        if (!input.checked) return;
+        current = value;
+        store('shell', value);
+        paint();
+      });
+      switcher.append(input, h('label', { for: id }, label));
+    }
+    paint();
+    return h('div', { class: 'shell-snippet' }, switcher, code);
   }
 
   function renderRaw(answer, request) {
@@ -1536,8 +2455,7 @@
     details.append(h('pre', {}, JSON.stringify(answer, null, 2)));
     if (request) {
       const url = location.origin + '/api/collections/' + enc(answer.collection_id) + '/ask';
-      const curl = 'curl -s -X POST ' + shellQuote(url) + ' -H ' + shellQuote('Content-Type: application/json') + ' -d ' + shellQuote(JSON.stringify(request));
-      details.append(h('p', { class: 'muted small' }, 'The same request from a terminal:'), codeBlock(curl, 'Copy'));
+      details.append(h('p', { class: 'muted small' }, 'The same request from a terminal:'), shellSnippet(url, request));
     }
     return details;
   }
@@ -1555,6 +2473,14 @@
 
   function stateChip(ok, yes, no) {
     return h('span', { class: 'chip ' + (ok ? 'chip-ready' : 'chip-failed') }, ok ? yes : no);
+  }
+
+  function setupSettings() {
+    $('settings-refresh').addEventListener('click', () => {
+      renderSettings(true);
+      renderFeedbackPanel();
+    });
+    $('feedback-refresh').addEventListener('click', () => renderFeedbackPanel());
   }
 
   async function renderSettings(refresh) {
@@ -1597,9 +2523,17 @@
     body.append(providers);
 
     const counts = health.counts || {};
+    let documents = null;
+    if (finite(counts.documents_ready)) {
+      const processing = Number(counts.documents_processing) || 0;
+      const failed = Number(counts.documents_failed) || 0;
+      // The health counts have no cancelled figure: it is what the total holds beyond the other three.
+      const cancelled = Math.max(0, (Number(counts.documents_total) || 0) - counts.documents_ready - processing - failed);
+      documents = searchableText({ ready: counts.documents_ready, processing, failed, cancelled });
+    }
     body.append(h('section', { class: 'card' }, h('h3', {}, 'Index'), kv([
       ['Collections', counts.collections],
-      ['Documents', counts.documents],
+      ['Documents', documents],
       ['Passages', counts.chunks],
       ['Metadata store', stateChip(health.store && health.store.metadata === 'ok', 'OK', 'Unavailable')],
       ['Vector store', stateChip(health.store && health.store.vector === 'ok', 'OK', 'Unavailable')],
@@ -1617,11 +2551,11 @@
 
     const stats = state.stats;
     if (stats) {
-      const byStatus = Object.entries(stats.by_status || {}).map(([k, v]) => v + ' ' + k).join(', ');
       const byType = Object.entries(stats.by_media_type || {}).map(([k, v]) => v + ' ' + fmtType(k)).join(', ');
+      const collectionCountsNow = state.docsLoaded ? countsFromDocs(state.docs) : statsCounts(stats);
       body.append(h('section', { class: 'card' }, h('h3', {}, 'This collection'), kv([
         ['Name', stats.name],
-        ['Documents', stats.documents + (byStatus ? ' (' + byStatus + ')' : '')],
+        ['Documents', searchableText(collectionCountsNow)],
         ['Types', byType || 'none'],
         ['Passages', stats.chunks],
         ['Pages', stats.pages || null],
@@ -1634,7 +2568,7 @@
     body.append(h('section', { class: 'card wide' }, h('h3', {}, 'Storage and limits'), kv([
       ['Data folder', codeBlock(health.data_dir || '', 'Copy')],
       ['Upload limit', health.max_upload_mb + ' MB per file'],
-      ['File types', (health.supported_types || []).join(' ')],
+      ['File types', Array.from(acceptedTypes()).join(' ')],
       ['Questions', limit.per_minute ? limit.per_minute + ' per minute (' + limit.scope + ')' : null],
       ['Version', 'rag-kb ' + health.version],
     ])));
@@ -1644,6 +2578,46 @@
         h('ul', { class: 'problem-list' }, health.problems.map((p) => h('li', {}, p))),
         h('p', { class: 'muted small' }, 'Run "ragkb doctor" in a terminal for a full check.')));
     }
+  }
+
+  /* Feedback review: the collection's votes, newest first, each with a link that opens the answer. */
+  async function renderFeedbackPanel() {
+    const body = $('feedback-body');
+    const cid = state.current;
+    if (!cid) {
+      body.replaceChildren(h('p', { class: 'muted small' }, 'Pick a collection to see its feedback.'));
+      return;
+    }
+    body.replaceChildren(h('p', { class: 'muted small' }, 'Loading feedback...'));
+    let items;
+    try {
+      items = await api('GET', '/api/collections/' + enc(cid) + '/feedback?limit=100');
+    } catch (e) {
+      if (cid === state.current) body.replaceChildren(h('p', { class: 'error-text small' }, 'Feedback could not be loaded: ' + e.message));
+      return;
+    }
+    if (cid !== state.current) return;
+    items = Array.isArray(items) ? items : [];
+    if (!items.length) {
+      body.replaceChildren(h('p', { class: 'muted small' }, 'No feedback yet. Votes left under answers on the Ask tab appear here.'));
+      return;
+    }
+    const up = items.filter((f) => f.rating === 'up').length;
+    const rows = items.map((f) => h('tr', {},
+      whenCell(f.created_at),
+      h('td', {}, h('span', { class: 'chip ' + (f.rating === 'up' ? 'chip-ready' : 'chip-failed') }, f.rating === 'up' ? 'Helpful' : 'Not helpful')),
+      h('td', { class: 'wrap' }, f.question ? f.question : h('span', { class: 'muted' }, 'not recorded')),
+      h('td', { class: 'wrap' }, f.note || ''),
+      h('td', {}, f.answer_id ? h('a', {
+        href: '#/answer/' + enc(f.answer_id),
+        'aria-label': f.question ? 'Open answer to: ' + f.question : 'Open answer',
+      }, 'Open answer') : '')));
+    body.replaceChildren(
+      h('p', { class: 'small' }, plural(items.length, 'vote') + ': ' + up + ' helpful, ' + (items.length - up) + ' not helpful'
+        + (items.length >= 100 ? ' (the latest 100)' : '') + '.'),
+      h('div', { class: 'table-scroll' }, h('table', { class: 'simple-table feedback-table' },
+        h('thead', {}, h('tr', {}, ['When', 'Rating', 'Question', 'Note', 'Answer'].map((t) => h('th', { scope: 'col' }, t)))),
+        h('tbody', {}, rows))));
   }
 
   // ------------------------------------------------------------------ connect
@@ -1698,7 +2672,7 @@
   function renderHelpStates() {
     const box = $('help-states');
     const base = {
-      id: '', question: 'How many days of annual leave do employees get?', collection_id: 'sample', citations: [],
+      id: '', question: 'How many days of annual leave do employees get?', collection_id: 'sample', citations: [], closest: [],
       passages_considered: 6, provider: { name: 'claude_code', model: 'sonnet', elapsed_ms: 11800 },
       knowledge_version: 'v20261010.3', language: 'en', created_at: new Date().toISOString(),
     };
@@ -1707,12 +2681,16 @@
         status: 'answered', message: null,
         answer: 'Employees get **25 days** of annual leave per calendar year [1].\n\n- Up to five unused days carry over to the next year [1].\n- Carried-over days expire at the end of March [2].',
         citations: [
-          { marker: 1, chunk_id: 's#1', doc_id: 's', title: 'Leave policy', page: 2, section: 'Leave policy > Annual leave', snippet: 'Every employee gets 25 days of annual leave per calendar year. Up to five unused days carry over...', score: 0.032 },
-          { marker: 2, chunk_id: 's#2', doc_id: 's', title: 'Leave policy', page: 3, section: 'Leave policy > Carry-over', snippet: 'Days carried over expire at the end of March of the following year.', score: 0.024 },
+          { marker: 1, chunk_id: 's#1', doc_id: 's', title: 'Leave policy', page: 2, page_end: 3, section: 'Leave policy > Annual leave', snippet: 'Every employee gets 25 days of annual leave per calendar year. Up to five unused days carry over...', score: 0.032, vector_score: 0.81 },
+          { marker: 2, chunk_id: 's#2', doc_id: 's', title: 'Leave policy', page: 3, section: 'Leave policy > Carry-over', snippet: 'Days carried over expire at the end of March of the following year.', score: 0.024, vector_score: 0.64 },
         ],
       }],
-      ['no_answer', 'Not covered', 'The documents were searched but none of them answers the question. Nothing is guessed.', {
+      ['no_answer', 'Not covered', 'None of the documents answers the question. Nothing is guessed; the closest passages are shown so you can judge.', {
         status: 'no_answer', answer: null, message: 'The knowledge base does not cover this question.',
+        question: 'Can I bring my dog to work?',
+        closest: [
+          { marker: 1, chunk_id: 'w#4', doc_id: 'w', title: 'Workplace guidelines', page: 4, section: 'Workplace guidelines > Visitors', snippet: 'Visitors must sign in at reception and be accompanied at all times...', score: 0.016, vector_score: 0.42 },
+        ],
       }],
       ['no_documents', 'No documents', 'The collection is empty, or nothing in it is indexed yet.', {
         status: 'no_documents', answer: null, passages_considered: 0, message: 'This collection has no documents yet. Upload some to get started.',
@@ -1747,17 +2725,33 @@
 
   async function start() {
     setupTheme();
+    restoreCached();
     setupTabs();
     setupCollectionForm();
     setupUploads();
     setupAsk();
+    setupSettings();
+    setupDocsLayout();
     renderHelpStates();
-    if (!routeFromHash(false)) selectTab(recall('tab', 'documents'), { hash: false });
-    window.addEventListener('hashchange', () => routeFromHash(true));
+    const initial = parseHash(location.hash);
+    let firstTab = recall('tab', 'documents');
+    if (initial && initial.answer) firstTab = 'ask';
+    else if (initial && initial.tab) firstTab = initial.tab;
+    selectTab(firstTab, { route: 'none' });
+    window.addEventListener('popstate', onLocationChange);
+    window.addEventListener('hashchange', onLocationChange);
+    const startHash = location.hash;
     await loadHealth();
-    await Promise.all([loadCollections(null), loadProviders(false)]);
-    if (/^#ask\/./.test(location.hash)) routeFromHash(true);
+    // The provider check can take seconds (it asks the CLIs); the page is usable before it ends.
+    const providers = loadProviders(false);
+    await loadCollections(initial ? initial.cid : null, 'none');
+    // Correct the address once, unless the person has already moved on (asked a question, changed tab).
+    if (location.hash === startHash) {
+      if (initial && initial.answer) await loadStoredAnswer(initial.answer, 'replace');
+      else setRoute(hashFor(state.current, state.tab), 'replace');
+    }
     window.setInterval(loadHealth, HEALTH_EVERY_MS);
+    await providers;
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);

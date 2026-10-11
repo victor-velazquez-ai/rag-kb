@@ -147,6 +147,121 @@ def test_css_defines_light_system_dark_and_forced_dark():
     assert set(system_dark) <= set(light), "every dark colour needs a light counterpart"
 
 
+def _html() -> str:
+    return (UI_DIR / "index.html").read_text(encoding="utf-8")
+
+
+def _js() -> str:
+    return (UI_DIR / "app.js").read_text(encoding="utf-8")
+
+
+def test_folder_and_zip_upload_controls():
+    html = _html()
+    folder = re.search(r"<input\b[^>]*\bid=\"folder-input\"[^>]*>", html)
+    assert folder is not None, "a folder picker exists"
+    assert re.search(r"\bwebkitdirectory\b", folder.group(0)) and re.search(r"\bmultiple\b", folder.group(0))
+    assert re.search(r'<button\b[^>]*\bid="add-folder"[^>]*>Add folder</button>', html)
+    js = _js()
+    # Each folder file is sent with its path, aligned with the file in the same request.
+    assert "webkitRelativePath" in js and "form.append('relative_paths'" in js
+    # Dropped folders are walked, and .zip is accepted by the picker and the drop zone.
+    assert "webkitGetAsEntry" in js and "readEntries" in js
+    assert "const ARCHIVE = '.zip'" in js and "types.add(ARCHIVE)" in js
+
+
+def test_upload_rows_read_the_real_response():
+    js = _js()
+    # The 202 body is {jobs, rejected, skipped}: a Job per accepted file, {filename, source_path, code,
+    # message} per refused one, and the number of zip entries left out. No other shape is guessed at.
+    assert "data.jobs.map((job) => ({ job }))" in js
+    assert "(data.rejected || []).map((rejected) => ({ rejected }))" in js and "Number(data.skipped)" in js
+    assert "source.source_path || source.filename" in js
+    for guess in ("'results'", "'items'", "'code' in entry", "entry.error", "relative_path ||"):
+        assert guess not in js, guess
+    # /retry answers 409 for a row that did not fail; only then the page falls back to /reindex.
+    assert "if (e.status !== 409)" in js and "e.status !== 405" not in js
+    # Counts come from the documented keys only.
+    assert "stats.by_status" not in js and "Number(collection.documents)" not in js
+    for wording in ("'Rejected: '", "'Replaced '", "known: 'Already indexed'"):
+        assert wording in js, wording
+    hint = re.search(r'<p id="identity-hint"[^>]*>(.*?)</p>', _html(), flags=re.DOTALL)
+    assert hint is not None
+    text = " ".join(hint.group(1).split())
+    assert "file name" in text and "path" in text and "may repeat" in text
+
+
+def test_job_progress_cancel_and_queue_summary():
+    js = _js()
+    assert "'/api/jobs/' + enc(jobId) + '/cancel'" in js
+    assert "dataset: { action: 'cancel' }" in js and "actionButton('cancel', 'Cancel'" in js
+    for field in ("chunks_done", "chunks_total", "eta_seconds", "cancel_requested", "stage"):
+        assert f"job.{field}" in js, field
+    assert "'/jobs/summary'" in js and 'id="docs-summary"' in _html()
+    # Delete, dismiss, re-index and retry show a pending state, with a note after two seconds.
+    assert "const PENDING_NOTE_MS = 2000" in js and "function withPending" in js
+    assert "'/retry'" in js and "'Dismiss'" in js
+
+
+def test_documents_table_fits_its_container():
+    css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
+    table = _rule_body(css, r"\n\.docs-table")
+    assert "table-layout: fixed" in table and "820px" not in table
+    for column in ("col-status", "col-actions"):
+        assert re.search(rf"\.docs-table \.{column} \{{ width: \d+px; \}}", css), column
+    assert "container-type: inline-size" in css and "@container docs" in css
+    assert re.search(r"\.main \{[^}]*min-width: 0", css)
+    # The passages drawer spans every visible column, so it never sits inside a scrolled-off column.
+    assert "td.span-all" in _js() and "visibleColumns()" in _js()
+
+
+def test_scores_closest_passages_and_counts():
+    js = _js()
+    assert "c.vector_score" in js and "c.rerank_score" in js
+    assert "'similarity '" in js and "'reranker '" in js and "'rank '" in js
+    assert "closest-passages" in js and "answer.closest" in js and "'Closest passages'" in js
+    assert "'searchable document'" in js and "documents_by_status" in js and "documents_ready" in js
+    help_text = " ".join(_html().split())
+    assert "The rank score orders the sources; the similarity and reranker scores say how relevant each one is." in help_text
+
+
+def test_model_menu_is_disabled_without_models():
+    html = _html()
+    assert re.search(r'<label class="control" id="model-field">', html), "the Model field is never hidden"
+    js = _js()
+    assert "'no model'" in js and "select.disabled = true" in js
+
+
+def test_accessible_names():
+    js = _js()
+    assert "'aria-labelledby': nameId" in js and "'aria-describedby': descId" in js
+    assert "'aria-describedby': 'probe-hint'" in js and 'id="probe-hint"' in _html()
+
+
+def test_shell_switch_for_the_terminal_request():
+    js = _js()
+    assert "const SHELLS = [['bash', 'bash'], ['powershell', 'PowerShell'], ['cmd', 'cmd']]" in js
+    assert "recall('shell'" in js and "store('shell'" in js
+    assert "Invoke-RestMethod" in js and "curl -s -X POST" in js
+    # A literal backslash-u in the source would be easy to corrupt; the escape is built from the character code.
+    assert "String.fromCharCode(92)" in js
+
+
+def test_feedback_review_panel():
+    html = _html()
+    panel = re.search(r'<section id="feedback-panel"[^>]*>(.*?)</section>', html, flags=re.DOTALL)
+    assert panel is not None and 'id="feedback-body"' in panel.group(1)
+    assert "/feedback?limit=100" in _js() and "'#/answer/' + enc(f.answer_id)" in _js()
+
+
+def test_hash_routing_and_cached_status():
+    js = _js()
+    assert "'#/c/' + enc(collectionId) + '/' + tab" in js and "'#/answer/'" in js
+    assert "history.pushState" in js and "history.replaceState" in js
+    assert "addEventListener('popstate'" in js and "addEventListener('hashchange'" in js
+    # The last known health and providers render at once on a reload.
+    assert "recallJson('health')" in js and "recallJson('providers')" in js
+
+
 def test_css_colours_live_only_in_the_theme_variables():
     css = (UI_DIR / "styles.css").read_text(encoding="utf-8")
     css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
