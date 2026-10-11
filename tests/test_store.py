@@ -1,18 +1,23 @@
-"""Stores: LanceDB chunks (search, upsert, stale tail, isolation) and SQLite metadata (CRUD, version)."""
+"""Stores: LanceDB chunks (search, upsert, stale tail, isolation, neighbours, migration) and SQLite metadata
+(CRUD, lookups by path, job progress and cancel, feedback, version, migration)."""
 
 from __future__ import annotations
 
+import json
 import re
+import sqlite3
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
+import lancedb
+import pyarrow as pa
 import pytest
 
 from ragkb.models import Chunk, Document, DocumentStatus, Feedback
 from ragkb.retrieval.embedder import FakeEmbedder
 from ragkb.store import sqlite_meta
-from ragkb.store.lancedb_store import OPTIMIZE_EVERY, LanceDBStore, StoreError
+from ragkb.store.lancedb_store import REFRESH_MIN_ROWS, REFRESH_PENDING_ROWS, LanceDBStore, StoreError
 from ragkb.store.sqlite_meta import SQLiteMeta
 
 NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
@@ -126,17 +131,90 @@ def test_upsert_replaces_by_id_and_refreshes_the_text_index(
     assert store.text_search("c1", "economy", 5) == []
 
 
-def test_text_index_is_refreshed_periodically_and_never_misses_rows(
+def test_the_text_index_is_refreshed_after_a_document_never_during_one(
     store: LanceDBStore, embedder: FakeEmbedder
 ) -> None:
-    for n in range(OPTIMIZE_EVERY + 3):
-        put(store, embedder, make_chunks(f"d{n}", "c1", [f"Unique marker word{n} in document {n}."]))
-        assert [h.chunk.id for h in store.text_search("c1", f"word{n}", 3)] == [f"d{n}#0"]
-    stats = store._open().index_stats("text_idx")
-    assert stats.num_unindexed_rows < OPTIMIZE_EVERY, "a refresh folded earlier rows into the index"
+    """A document of REFRESH_MIN_ROWS chunks or more is folded into the index right after its one write;
+    small documents wait together until REFRESH_PENDING_ROWS rows wait. Waiting rows are always found."""
+
+    def unindexed() -> int:
+        return store._open().index_stats("text_idx").num_unindexed_rows
+
+    put(store, embedder, make_chunks("first", "c1", ["The index is built on the first write."]))
+    assert unindexed() == 0
+    for n in range(5):
+        put(store, embedder, make_chunks(f"d{n}", "c1", [f"Unique marker word{n} in document {n}.", "Filler."]))
+        assert [h.chunk.id for h in store.text_search("c1", f"word{n}", 3)] == [f"d{n}#0"], "found before a refresh"
+    assert unindexed() == 10, "five small documents were not refreshed one by one"
+    big = make_chunks("big", "c1", [f"Paragraph {i} of a long manual." for i in range(REFRESH_MIN_ROWS)])
+    put(store, embedder, big)
+    assert unindexed() == 0, "a large document is folded in at once, with what waited before it"
+    for n in range(REFRESH_PENDING_ROWS // 2 + 1):
+        put(store, embedder, make_chunks(f"s{n}", "c1", ["Small note.", f"Note word{n}x."]))
+    assert unindexed() < REFRESH_PENDING_ROWS, "waiting rows are folded in once enough wait"
     store.optimize()
-    assert store._open().index_stats("text_idx").num_unindexed_rows == 0
+    assert unindexed() == 0
     assert [h.chunk.id for h in store.text_search("c1", "word0", 3)] == ["d0#0"]
+
+
+def test_a_new_document_is_appended_and_an_existing_one_merged(
+    store: LanceDBStore, embedder: FakeEmbedder
+) -> None:
+    put(store, embedder, make_chunks("d1", "c1", TRAVEL))
+    put(store, embedder, make_chunks("d2", "c1", SECURITY))  # appended: no rows of d2 yet
+    put(store, embedder, make_chunks("d1", "c1", ["Rewritten first rule.", "Rewritten second rule."]))
+    assert [c.text for c in store.chunks_for("d1")][:2] == ["Rewritten first rule.", "Rewritten second rule."]
+    assert len(store.chunks_for("d1")) == len(TRAVEL), "merge by id: the tail stays until it is dropped"
+    assert store.count("c1") == len(TRAVEL) + len(SECURITY)
+
+
+def test_page_span_round_trips(store: LanceDBStore, embedder: FakeEmbedder) -> None:
+    chunks = make_chunks("d1", "c1", TRAVEL[:2])
+    chunks[0] = chunks[0].model_copy(update={"page": 3, "page_start": 3, "page_end": 3})
+    chunks[1] = chunks[1].model_copy(update={"page": None, "page_start": None, "page_end": None})
+    put(store, embedder, chunks)
+    first, second = store.chunks_for("d1")
+    assert (first.page, first.page_start, first.page_end) == (3, 3, 3)
+    assert (second.page, second.page_start, second.page_end) == (None, None, None)
+    hit = store.text_search("c1", "economy", 1)[0]
+    assert (hit.chunk.page_start, hit.chunk.page_end) == (3, 3)
+
+
+def test_neighbours(store: LanceDBStore, embedder: FakeEmbedder) -> None:
+    put(store, embedder, make_chunks("d1", "c1", [f"Paragraph {i}." for i in range(6)]))
+    put(store, embedder, make_chunks("d2", "c1", [f"Other {i}." for i in range(6)]))
+    assert [c.ordinal for c in store.neighbours("d1", 3)] == [2, 3, 4]
+    assert [c.ordinal for c in store.neighbours("d1", 3, span=2)] == [1, 2, 3, 4, 5]
+    assert [c.ordinal for c in store.neighbours("d1", 0)] == [0, 1]
+    assert [c.ordinal for c in store.neighbours("d1", 5, span=3)] == [2, 3, 4, 5]
+    assert [c.ordinal for c in store.neighbours("d1", 2, span=0)] == [2]
+    assert {c.doc_id for c in store.neighbours("d1", 3, span=10)} == {"d1"}
+    assert store.neighbours("missing", 1) == []
+
+
+def test_a_table_from_before_page_spans_is_migrated(settings, embedder: FakeEmbedder) -> None:
+    old_schema = pa.schema(
+        [
+            pa.field(name, pa.int32() if name in ("ordinal", "page", "char_start", "char_end", "token_estimate")
+                     else pa.string())
+            for name in ["id", "doc_id", "collection_id", "ordinal", "text", "embed_text", "title", "section", "page",
+                         "char_start", "char_end", "token_estimate", "knowledge_version", "created_at"]
+        ]
+        + [pa.field("vector", pa.list_(pa.float32(), embedder.dims))]
+    )
+    db = lancedb.connect(str(settings.lancedb_dir))
+    row = {
+        "id": "old#0", "doc_id": "old", "collection_id": "c1", "ordinal": 0, "text": "Hotels are capped.",
+        "embed_text": "Old: Hotels are capped.", "title": "Old", "section": "", "page": 7, "char_start": 0,
+        "char_end": 18, "token_estimate": 3, "knowledge_version": "v20261010.1", "created_at": NOW.isoformat(),
+        "vector": embedder.embed(["Hotels are capped."])[0],
+    }
+    db.create_table("chunks", data=pa.Table.from_pylist([row], schema=old_schema))
+    store = LanceDBStore(settings.lancedb_dir, dims=embedder.dims)
+    [chunk] = store.chunks_for("old")
+    assert (chunk.page, chunk.page_start, chunk.page_end) == (7, 7, 7)
+    put(store, embedder, make_chunks("new", "c1", TRAVEL))
+    assert store.count("c1") == 1 + len(TRAVEL)
 
 
 def test_delete_doc_and_stale_tail(store: LanceDBStore, embedder: FakeEmbedder) -> None:
@@ -359,18 +437,76 @@ def test_update_document_rejects_bad_fields_and_missing_rows(meta: SQLiteMeta) -
         meta.update_document("missing", chunk_count=1)
 
 
+def test_find_by_path_and_count_documents(meta: SQLiteMeta) -> None:
+    c = meta.create_collection("C")
+    meta.create_document(make_document(c.id, id="a", title="Introduction", source_path="guides/a/README.md"))
+    meta.create_document(
+        make_document(c.id, id="b", title="Introduction", source_path="guides/b/README.md", status="ready")
+    )
+    meta.create_document(make_document(c.id, id="c", content_hash="abc", source_path="c.md", status="failed"))
+    assert meta.find_by_path(c.id, "guides/b/README.md").id == "b"
+    assert meta.find_by_path(c.id, "README.md") is None
+    assert meta.find_by_path("other", "guides/a/README.md") is None
+    assert meta.count_documents(c.id) == {"queued": 1, "ready": 1, "failed": 1}
+    assert meta.count_documents("other") == {}
+    assert meta.find_by_hash(c.id, "abc").id == "b", "a ready document wins over a failed one with the same bytes"
+
+
 def test_jobs(meta: SQLiteMeta) -> None:
     c = meta.create_collection("C")
     job = meta.create_job(c.id, "doc1")
-    assert job.status == DocumentStatus.queued and job.finished_at is None
+    assert job.status == DocumentStatus.queued and job.finished_at is None and job.stage == "queued"
     running = meta.update_job(job.id, DocumentStatus.processing)
-    assert running.finished_at is None
+    assert running.finished_at is None and running.stage == "queued"
     done = meta.update_job(job.id, DocumentStatus.failed, error="The file is empty.")
     assert done.status == DocumentStatus.failed and done.error == "The file is empty." and done.finished_at
+    assert done.stage == "failed"
     assert [j.id for j in meta.list_jobs(c.id)] == [job.id]
     assert meta.get_job("missing") is None
     with pytest.raises(KeyError):
         meta.update_job("missing", DocumentStatus.ready)
+    with pytest.raises(KeyError):
+        meta.update_job("missing", stage="parsing")
+    cancelled = meta.update_job(meta.create_job(c.id, "").id, DocumentStatus.cancelled)
+    assert cancelled.stage == "cancelled" and cancelled.finished_at is not None
+
+
+def test_job_progress_without_a_status_keeps_the_status(meta: SQLiteMeta) -> None:
+    c = meta.create_collection("C")
+    job = meta.create_job(c.id, "", filename="big.txt", bytes_total=2_700_000)
+    assert (job.filename, job.bytes_total, job.chunks_done, job.chunks_total) == ("big.txt", 2_700_000, 0, None)
+    meta.update_job(job.id, DocumentStatus.processing)
+    step = meta.update_job(job.id, stage="embedding", chunks_done=64, chunks_total=2535, eta_seconds=41.6)
+    assert step.status == DocumentStatus.processing and step.finished_at is None
+    assert (step.stage, step.chunks_done, step.chunks_total, step.eta_seconds) == ("embedding", 64, 2535, 42)
+    assert meta.get_job(job.id) == step
+    finished = meta.update_job(
+        job.id, DocumentStatus.ready, doc_id="d1", replaced_doc_id="d1", replaced_title="Old title", eta_seconds=0
+    )
+    assert (finished.stage, finished.doc_id, finished.replaced_doc_id, finished.replaced_title) == (
+        "done",
+        "d1",
+        "d1",
+        "Old title",
+    )
+    duplicate = meta.update_job(meta.create_job(c.id, "d1").id, DocumentStatus.ready, already_indexed=True)
+    assert duplicate.already_indexed is True
+    with pytest.raises(ValueError, match="nonsense"):
+        meta.update_job(job.id, nonsense=1)
+    with pytest.raises(ValueError, match="stage"):
+        meta.update_job(job.id, stage="sleeping")
+
+
+def test_cancel_requests(meta: SQLiteMeta) -> None:
+    c = meta.create_collection("C")
+    job = meta.create_job(c.id, "")
+    assert meta.cancel_requested(job.id) is False
+    assert meta.request_cancel(job.id).cancel_requested is True
+    assert meta.cancel_requested(job.id) is True
+    finished = meta.update_job(meta.create_job(c.id, "").id, DocumentStatus.ready)
+    assert meta.request_cancel(finished.id).cancel_requested is False, "a finished job is left as it is"
+    assert meta.request_cancel("missing") is None
+    assert meta.cancel_requested("missing") is False
 
 
 def test_job_records_the_document_it_produced(meta: SQLiteMeta) -> None:
@@ -396,6 +532,56 @@ def test_answers_and_feedback(meta: SQLiteMeta) -> None:
     meta.delete_collection(c1.id)
     assert meta.get_answer("a1") is None and meta.list_feedback(c1.id) == []
     assert meta.get_answer("a2") is not None
+
+
+def test_feedback_rows_carry_an_id_the_collection_and_the_question(meta: SQLiteMeta) -> None:
+    c = meta.create_collection("C")
+    meta.save_answer(json.dumps({"id": "a1", "question": "How many leave days?"}), "a1", c.id)
+    meta.add_feedback(Feedback(answer_id="a1", rating="down", note="wrong year", created_at=NOW))
+    meta.add_feedback(Feedback(id="fixed-id", answer_id="a1", rating="up", created_at=NOW))
+    meta.add_feedback(
+        Feedback(answer_id="gone", collection_id=c.id, question="Asked before a restart?", rating="up", created_at=NOW)
+    )
+    latest, second, first = meta.list_feedback(c.id)
+    assert (first.collection_id, first.question, first.note) == (c.id, "How many leave days?", "wrong year")
+    assert len(first.id) == 32 and second.id == "fixed-id"
+    assert (latest.answer_id, latest.question) == ("gone", "Asked before a restart?")
+    assert len({f.id for f in meta.list_feedback()}) == 3
+
+
+def test_a_database_from_the_first_release_is_migrated(settings) -> None:
+    path = settings.meta_path
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL);
+            CREATE TABLE documents (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, title TEXT NOT NULL,
+                filename TEXT NOT NULL, media_type TEXT NOT NULL, size_bytes INTEGER NOT NULL,
+                content_hash TEXT NOT NULL, pages INTEGER, chunk_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL, error TEXT, uploaded_at TEXT NOT NULL, indexed_at TEXT,
+                knowledge_version TEXT, metadata TEXT NOT NULL DEFAULT '{}');
+            CREATE TABLE jobs (id TEXT PRIMARY KEY, collection_id TEXT NOT NULL, doc_id TEXT NOT NULL,
+                status TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, finished_at TEXT);
+            CREATE TABLE feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, answer_id TEXT NOT NULL, collection_id TEXT,
+                rating TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+            """
+        )
+        conn.execute("INSERT INTO collections VALUES ('c1', 'Old', '', ?)", (NOW.isoformat(),))
+        conn.execute(
+            "INSERT INTO documents (id, collection_id, title, filename, media_type, size_bytes, content_hash, "
+            "status, uploaded_at) VALUES ('d1', 'c1', 'Travel', 'travel.md', 'text/markdown', 10, 'h', 'ready', ?)",
+            (NOW.isoformat(),),
+        )
+        conn.execute("INSERT INTO jobs VALUES ('j1', 'c1', 'd1', 'ready', NULL, ?, ?)", (NOW.isoformat(),) * 2)
+        conn.execute("INSERT INTO feedback (answer_id, collection_id, rating, created_at) VALUES ('a', 'c1', 'up', ?)",
+                     (NOW.isoformat(),))
+    meta = SQLiteMeta(path)
+    assert meta.find_by_path("c1", "travel.md").id == "d1", "old rows take their file name as source path"
+    assert meta.get_job("j1").stage == "done"
+    assert [(f.id, f.collection_id) for f in meta.list_feedback()] == [("1", "c1")]
+    assert meta.update_job("j1", stage="done").cancel_requested is False
+    SQLiteMeta(path)  # opening again changes nothing
 
 
 def test_audit_log(meta: SQLiteMeta) -> None:

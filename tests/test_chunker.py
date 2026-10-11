@@ -1,16 +1,54 @@
-"""Chunker invariants: size bound, whole short blocks, table headers, overlap, metadata, determinism."""
+"""Chunker invariants: hard ceilings, size bound, whole short blocks, table headers, overlap, pages,
+metadata, determinism."""
 
 from __future__ import annotations
 
+import base64
+import math
+import random
 import re
 from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
-from ragkb.ingest.chunker import BLOCK_SEPARATOR, ChunkDraft, chunk_blocks, estimate_tokens
+from ragkb.ingest.chunker import BLOCK_SEPARATOR, ChunkDraft, _sentence_spans, chunk_blocks, estimate_tokens
 from ragkb.ingest.parsers import SUPPORTED_SUFFIXES, parse
 from ragkb.models import Block
+from ragkb.retrieval.embedder import FakeEmbedder
+
+FULL_STOP = chr(0x3002)  # the ideographic full stop
+COMMA = chr(0x3001)  # the ideographic comma
+
+
+def japanese(n_chars: int, *, stop: bool = True) -> str:
+    """Japanese-like text: kana and kanji in sentences of 20 to 40 characters, each ending with the
+    ideographic full stop (or the ideographic comma when ``stop`` is false), with no spaces."""
+    rng = random.Random(3)
+    out: list[str] = []
+    size = 0
+    while size < n_chars:
+        length = rng.randint(20, 40)
+        sentence = "".join(chr(rng.choice([0x3042, 0x3044, 0x304B, 0x306E, 0x4E00 + rng.randint(0, 3000)]))
+                           for _ in range(length))
+        out.append(sentence + (FULL_STOP if stop else COMMA))
+        size += length + 1
+    return "".join(out)
+
+
+def strict_counter(text: str) -> int:
+    """Stands in for a sub-word tokenizer on text without spaces: one token per three characters."""
+    return math.ceil(len(text) / 3)
+
+
+def squeeze(text: str) -> str:
+    return "".join(text.split())
+
+
+def assert_within_ceilings(chunks: list[ChunkDraft], count, max_tokens: int, max_chars: int) -> None:
+    for chunk in chunks:
+        assert len(chunk.text) <= max_chars, len(chunk.text)
+        assert count(chunk.embed_text) <= max_tokens, count(chunk.embed_text)
 
 
 def sentence(i: int) -> str:
@@ -29,11 +67,14 @@ def test_estimate_tokens() -> None:
     assert estimate_tokens("") == 0
     assert estimate_tokens("one two three four five six seven eight nine ten") == 13
     assert estimate_tokens("word") == 2
+    assert estimate_tokens(FULL_STOP * 3) == 3, "one per CJK character"
 
 
-def test_invalid_target_raises() -> None:
+def test_invalid_limits_raise() -> None:
     with pytest.raises(ValueError):
         chunk_blocks([Block(text="x")], title="t", target_tokens=0, overlap_tokens=0)
+    with pytest.raises(ValueError):
+        chunk_blocks([Block(text="x")], title="t", target_tokens=10, overlap_tokens=0, max_chars=0)
 
 
 def test_empty_input_gives_no_chunks() -> None:
@@ -43,15 +84,31 @@ def test_empty_input_gives_no_chunks() -> None:
 def test_short_blocks_pack_into_one_chunk_with_metadata() -> None:
     blocks = [
         Block(text="First paragraph.", heading_path=["Leave", "Annual"], page=3),
-        Block(text="Second paragraph.", heading_path=["Leave", "Annual"], page=4),
+        Block(text="Second paragraph.", heading_path=["Leave", "Annual"], page=3),
     ]
     [chunk] = chunk_blocks(blocks, title="Handbook", target_tokens=100, overlap_tokens=20)
     assert chunk.text == "First paragraph.\n\nSecond paragraph."
     assert chunk.section == "Leave > Annual"
-    assert chunk.page == 3
+    assert (chunk.page, chunk.page_start, chunk.page_end) == (3, 3, 3)
     assert chunk.embed_text == "Handbook > Leave > Annual: First paragraph.\n\nSecond paragraph."
     assert (chunk.char_start, chunk.char_end) == (0, len(chunk.text))
     assert chunk.token_estimate == estimate_tokens(chunk.text)
+
+
+def test_token_counts_come_from_the_given_counter() -> None:
+    [chunk] = chunk_blocks(
+        [Block(text="Three words here.")], title="T", target_tokens=100, overlap_tokens=0, count_tokens=len
+    )
+    assert chunk.token_estimate == len("Three words here.")
+    embedder = FakeEmbedder()
+    [chunk] = chunk_blocks(
+        [Block(text=FULL_STOP.join(["ab cd"] * 3))],
+        title="T",
+        target_tokens=100,
+        overlap_tokens=0,
+        count_tokens=embedder.count_tokens,
+    )
+    assert chunk.token_estimate == embedder.count_tokens(chunk.text) == 6 + 2
 
 
 def test_embed_text_without_section() -> None:
@@ -216,6 +273,124 @@ def test_page_is_where_the_chunk_starts() -> None:
     blocks = [Block(text=long_paragraph(3), page=1), Block(text=long_paragraph(3, start=10), page=2)]
     chunks = chunk_blocks(blocks, title="T", target_tokens=60, overlap_tokens=0)
     assert [c.page for c in chunks] == [1, 2]
+
+
+def test_chunks_never_span_pages() -> None:
+    """Short pages are not packed together, so every chunk's page is exact; overlap never crosses a page."""
+    blocks = [
+        Block(text="Fact one is on the first page.", page=1),
+        Block(text="Fact two is also on the first page.", page=1),
+        Block(text="Fact three is on page two.", page=2),
+        Block(text=long_paragraph(12), page=3),
+        Block(text=long_paragraph(12, start=50), page=4),
+    ]
+    chunks = chunk_blocks(blocks, title="T", target_tokens=60, overlap_tokens=20)
+    for chunk in chunks:
+        assert chunk.page == chunk.page_start == chunk.page_end
+    assert chunks[0].text == "Fact one is on the first page.\n\nFact two is also on the first page."
+    assert (chunks[1].text, chunks[1].page) == ("Fact three is on page two.", 2)
+    page_four = [c for c in chunks if c.page == 4]
+    assert page_four and all("number 11 " not in c.text for c in page_four), "no overlap from page 3"
+    page_three = " ".join(c.text for c in chunks if c.page == 3)
+    assert not re.search(r"number (5\d|6[01]) ", page_three), "page 4 text stays on page 4"
+
+
+def test_a_heading_ending_a_page_travels_with_the_next_page() -> None:
+    blocks = [
+        Block(text="Intro text on page one.", heading_path=[], page=1),
+        Block(text="Refunds", heading_path=["Refunds"], page=1, kind="heading"),
+        Block(text="Refunds are paid within 14 days.", heading_path=["Refunds"], page=2),
+    ]
+    first, second = chunk_blocks(blocks, title="T", target_tokens=200, overlap_tokens=0)
+    assert (first.text, first.page) == ("Intro text on page one.", 1)
+    assert second.text == "Refunds\n\nRefunds are paid within 14 days."
+    assert (second.page, second.page_start, second.page_end, second.section) == (2, 2, 2, "Refunds")
+
+
+def test_formats_without_pages_have_no_page_span() -> None:
+    [chunk] = chunk_blocks([Block(text="No pages here.")], title="T", target_tokens=50, overlap_tokens=0)
+    assert (chunk.page, chunk.page_start, chunk.page_end) == (None, None, None)
+
+
+# ------------------------------------------------------------------------------------ hard ceilings
+
+
+def test_a_200_kb_line_without_spaces_is_cut_into_windows() -> None:
+    line = "x" * 200_000
+    chunks = chunk_blocks([Block(text=line)], title="T", target_tokens=350, overlap_tokens=60, max_chars=4000)
+    assert len(chunks) >= 50
+    assert all(len(c.text) <= 4000 for c in chunks)
+    assert squeeze("".join(c.text for c in chunks)) == line
+    strict = chunk_blocks(
+        [Block(text=line)], title="T", target_tokens=350, overlap_tokens=60, count_tokens=strict_counter, max_tokens=510
+    )
+    assert_within_ceilings(strict, strict_counter, 510, 4000)
+    assert squeeze("".join(c.text for c in strict)) == line
+
+
+def test_japanese_text_splits_on_its_sentence_terminators() -> None:
+    text = japanese(7150)
+    chunks = chunk_blocks([Block(text=text)], title="T", target_tokens=350, overlap_tokens=0)
+    assert len(chunks) >= 15, "350 tokens is about 350 CJK characters"
+    assert all(c.text.endswith(FULL_STOP) for c in chunks), "cut after a full stop, not inside a sentence"
+    assert_within_ceilings(chunks, estimate_tokens, 512, 4000)
+    assert squeeze("".join(c.text for c in chunks)) == text
+
+
+def test_japanese_text_without_full_stops_splits_at_commas() -> None:
+    text = japanese(7150, stop=False)
+    chunks = chunk_blocks([Block(text=text)], title="T", target_tokens=350, overlap_tokens=0)
+    assert len(chunks) >= 15
+    assert all(c.text.endswith(COMMA) for c in chunks[:-1])
+    assert squeeze("".join(c.text for c in chunks)) == text
+
+
+def test_cjk_sentence_spans() -> None:
+    a, b = "a" * 5 + FULL_STOP, "b" * 4 + chr(0xFF01)  # ideographic full stop, full-width exclamation mark
+    text = f"{a}{b}English after. Next sentence."
+    assert [text[s:e] for s, e in _sentence_spans(text)] == [a, b, "English after.", "Next sentence."]
+    mixed = "It costs 5 EUR. " + "c" * 3 + FULL_STOP
+    assert [mixed[s:e] for s, e in _sentence_spans(mixed)] == [mixed]  # "c" is not a sentence start
+
+
+def test_a_base64_blob_respects_both_ceilings() -> None:
+    blob = base64.b64encode(random.Random(5).randbytes(150_000)).decode()
+    chunks = chunk_blocks(
+        [Block(text=f"Attachment follows: {blob}")],
+        title="T",
+        target_tokens=350,
+        overlap_tokens=60,
+        count_tokens=strict_counter,
+        max_tokens=510,
+        max_chars=4000,
+    )
+    assert_within_ceilings(chunks, strict_counter, 510, 4000)
+    assert all(c.token_estimate <= 350 for c in chunks)
+    assert blob in squeeze("".join(c.text for c in chunks))
+
+
+def test_a_long_url_list_is_cut_between_urls() -> None:
+    urls = [f"https://example.invalid/docs/section-{i}/page-{i * 7}.html?ref=list&n={i}" for i in range(3000)]
+    chunks = chunk_blocks(
+        [Block(text=" ".join(urls))], title="Links", target_tokens=350, overlap_tokens=60, count_tokens=strict_counter
+    )
+    assert_within_ceilings(chunks, strict_counter, 512, 4000)
+    pieces = [url for c in chunks for url in c.text.split()]
+    assert set(pieces) == set(urls), "every URL survives whole"
+
+
+def test_embed_text_never_passes_the_model_window() -> None:
+    """The title and section prefix count too: a passage that fits the target but not the window with
+    its prefix is cut further, never embedded truncated."""
+    blocks = [
+        Block(text=long_paragraph(30), heading_path=["A very long section heading " * 4]),
+        Block(text="\n".join(f"Row {i} | value {i}" for i in range(200)), kind="table", heading_path=["Table"]),
+        Block(text="y" * 9000, heading_path=["Blob"]),
+    ]
+    chunks = chunk_blocks(
+        blocks, title="Title " * 20, target_tokens=350, overlap_tokens=60, count_tokens=len, max_tokens=300, max_chars=4000
+    )
+    assert_within_ceilings(chunks, len, 300, 4000)
 
 
 def test_char_offsets_point_into_the_document_text() -> None:

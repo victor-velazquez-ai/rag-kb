@@ -4,11 +4,18 @@ One table, ``chunks``, holds every collection. Every read and every destructive 
 collection or document filter, and searches filter before ranking (prefilter), so a search in one
 collection can never return or be crowded out by another collection's chunks.
 
-The table is created on the first upsert. Upserts merge by chunk id in one commit. The full-text
-index on ``text`` is built on the first upsert and refreshed (new rows folded in, files compacted)
-every ``OPTIMIZE_EVERY`` writes; rows written since the last refresh are still found, because LanceDB
-scans unindexed rows too. Writes are serialized with a lock; reads run concurrently and always see the
-latest commit.
+The table is created on the first upsert. An upsert writes all its chunks in one commit: a plain
+append when none of their documents has rows yet, otherwise a merge by chunk id. The pipeline upserts a
+whole document at once, so a document costs one write. The full-text index on ``text`` is built on the
+first upsert. Afterwards it is refreshed (new rows folded in, files compacted) right after any upsert of
+REFRESH_MIN_ROWS rows or more, so at most once per document and never while a document is being
+written; small upserts are folded in together once REFRESH_PENDING_ROWS rows wait. A refresh costs time
+that grows with the table (about 0.3 to 1 second at 20,000 rows) while an append costs about 0.07
+seconds, so a folder of small files is not slowed down by one refresh per file. Rows that wait are
+still found, because LanceDB also scans unindexed rows.
+
+Writes (upsert with its refresh, deletes) are serialized by one short lock held only around the
+LanceDB calls; reads take no lock, run concurrently and always see the latest commit.
 """
 
 from __future__ import annotations
@@ -28,7 +35,10 @@ from ragkb.models import Chunk, Hit
 log = logging.getLogger(__name__)
 
 TABLE_NAME = "chunks"
-OPTIMIZE_EVERY = 16
+# An upsert of at least this many rows refreshes the full-text index right away.
+REFRESH_MIN_ROWS = 64
+# Smaller upserts are folded into the index together once this many rows wait.
+REFRESH_PENDING_ROWS = 512
 _CHUNK_COLUMNS = [
     "id",
     "doc_id",
@@ -39,12 +49,16 @@ _CHUNK_COLUMNS = [
     "title",
     "section",
     "page",
+    "page_start",
+    "page_end",
     "char_start",
     "char_end",
     "token_estimate",
     "knowledge_version",
     "created_at",
 ]
+# Columns added after the first release, with the SQL that fills them in an older table.
+_ADDED_COLUMNS = {"page_start": "page", "page_end": "page"}
 
 
 class StoreError(RuntimeError):
@@ -63,6 +77,8 @@ def _schema(dims: int) -> pa.Schema:
             pa.field("title", pa.string()),
             pa.field("section", pa.string()),
             pa.field("page", pa.int32()),
+            pa.field("page_start", pa.int32()),
+            pa.field("page_end", pa.int32()),
             pa.field("char_start", pa.int32()),
             pa.field("char_end", pa.int32()),
             pa.field("token_estimate", pa.int32()),
@@ -90,7 +106,7 @@ class LanceDBStore:
         self._db = lancedb.connect(str(self.path), read_consistency_interval=timedelta(0))
         self._lock = threading.RLock()
         self._table: Any = None
-        self._writes_since_optimize = 0
+        self._pending_rows = 0  # rows written since the last full-text refresh
 
     # ------------------------------------------------------------------------------------- table
 
@@ -104,10 +120,21 @@ class LanceDBStore:
         with self._lock:
             if self._table is None:
                 if TABLE_NAME in self._table_names():
-                    self._table = self._db.open_table(TABLE_NAME)
+                    table = self._db.open_table(TABLE_NAME)
+                    self._add_missing_columns(table)
+                    self._table = table
                 elif create:
                     self._table = self._db.create_table(TABLE_NAME, schema=_schema(self.dims))
         return self._table
+
+    @staticmethod
+    def _add_missing_columns(table: Any) -> None:
+        """Give a table written by an older version the columns added since."""
+        names = set(table.schema.names)
+        missing = {column: sql for column, sql in _ADDED_COLUMNS.items() if column not in names}
+        if missing:
+            table.add_columns(missing)
+            log.info("added columns %s to the chunks table", ", ".join(sorted(missing)))
 
     def _require_dims(self, table: Any) -> None:
         stored = table.schema.field("vector").type.list_size
@@ -123,26 +150,29 @@ class LanceDBStore:
             for index in table.list_indices()
         )
 
-    def _refresh_text_index(self, table: Any) -> None:
-        """Build the full-text index on first use; afterwards refresh it every OPTIMIZE_EVERY writes."""
-        self._writes_since_optimize += 1
+    def _refresh_text_index(self, table: Any, written: int) -> None:
+        """After an upsert of ``written`` rows: build the full-text index on first use; afterwards fold the
+        waiting rows in when this upsert was large or enough rows wait (see the module docstring)."""
+        self._pending_rows += written
         try:
             if not self._has_text_index(table):
                 table.create_index("text", config=FTS(), replace=True)
-                self._writes_since_optimize = 0
-            elif self._writes_since_optimize >= OPTIMIZE_EVERY:
-                self.optimize()
+            elif written >= REFRESH_MIN_ROWS or self._pending_rows >= REFRESH_PENDING_ROWS:
+                table.optimize()
+            else:
+                return
+            self._pending_rows = 0
         except Exception as exc:  # noqa: BLE001 - unindexed rows stay searchable; log and carry on
             log.warning("full-text index refresh failed: %s", exc)
 
     def optimize(self) -> None:
-        """Fold new rows into the full-text index and compact the table files."""
+        """Fold every waiting row into the full-text index and compact the table files."""
         table = self._open()
         if table is None:
             return
         with self._lock:
             table.optimize()
-            self._writes_since_optimize = 0
+            self._pending_rows = 0
 
     def ensure_text_index(self) -> bool:
         """Create the full-text index if the table exists without one. True when an index exists."""
@@ -157,7 +187,7 @@ class LanceDBStore:
     # ------------------------------------------------------------------------------------- writes
 
     def upsert(self, chunks: list[Chunk], vectors: list[list[float]]) -> None:
-        """Insert or replace chunks by id, in one commit."""
+        """Insert or replace chunks by id in one commit, then refresh the full-text index when due."""
         if len(chunks) != len(vectors):
             raise ValueError(f"Got {len(chunks)} chunks but {len(vectors)} vectors.")
         if not chunks:
@@ -172,11 +202,15 @@ class LanceDBStore:
             row["vector"] = [float(x) for x in vector]
             rows.append(row)
         data = pa.Table.from_pylist(rows, schema=_schema(self.dims))
+        doc_ids = sorted({chunk.doc_id for chunk in chunks})
         with self._lock:
             table = self._open(create=True)
             self._require_dims(table)
-            table.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(data)
-            self._refresh_text_index(table)
+            if table.count_rows(f"doc_id IN ({', '.join(_quote(d) for d in doc_ids)})") == 0:
+                table.add(data)
+            else:
+                table.merge_insert("id").when_matched_update_all().when_not_matched_insert_all().execute(data)
+            self._refresh_text_index(table, len(rows))
 
     def delete_doc(self, doc_id: str, *, keep_ordinals_below: int | None = None) -> int:
         """Delete a document's chunks; with a bound, only those with ordinal >= the bound (the stale tail)."""
@@ -247,10 +281,19 @@ class LanceDBStore:
 
     def chunks_for(self, doc_id: str) -> list[Chunk]:
         """All chunks of one document in ordinal order."""
+        return self._chunks_where(f"doc_id = {_quote(doc_id)}")
+
+    def neighbours(self, doc_id: str, ordinal: int, span: int = 1) -> list[Chunk]:
+        """The chunks of one document from ``ordinal - span`` to ``ordinal + span``, in ordinal order
+        (fewer at the ends of the document)."""
+        span = max(0, int(span))
+        low, high = int(ordinal) - span, int(ordinal) + span
+        return self._chunks_where(f"doc_id = {_quote(doc_id)} AND ordinal >= {low} AND ordinal <= {high}")
+
+    def _chunks_where(self, where: str) -> list[Chunk]:
         table = self._open()
         if table is None:
             return []
-        where = f"doc_id = {_quote(doc_id)}"
         n = table.count_rows(where)
         if n == 0:
             return []
@@ -276,4 +319,4 @@ class LanceDBStore:
 
     @staticmethod
     def _chunk(row: dict[str, Any]) -> Chunk:
-        return Chunk(**{key: row[key] for key in _CHUNK_COLUMNS})
+        return Chunk(**{key: row.get(key) for key in _CHUNK_COLUMNS})

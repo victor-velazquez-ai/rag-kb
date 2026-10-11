@@ -2,22 +2,40 @@
 
 from __future__ import annotations
 
+import io
 from datetime import date
 from pathlib import Path
 
 import pytest
 from docx import Document as WordDocument
 from openpyxl import Workbook
+from pypdf import PdfReader, PdfWriter
 
 from ragkb.ingest.parsers import (
     SUPPORTED_SUFFIXES,
     EmptyDocumentError,
+    EncryptedFileError,
     ParseError,
     UnsupportedFileTypeError,
+    check_not_encrypted,
     media_type_for,
     parse,
     title_from_filename,
 )
+
+BODY = [
+    "The regional teams reported fewer incidents this year than in any year before, and the board",
+    "asked every site to keep the weekly safety walk that made the difference in the first quarter.",
+    "Contractors follow the same induction as staff, which now takes two hours instead of four.",
+]
+
+
+def encrypted_pdf(data: bytes, user_password: str = "secret") -> bytes:
+    writer = PdfWriter(clone_from=PdfReader(io.BytesIO(data)))
+    writer.encrypt(user_password, owner_password="owner", algorithm="RC4-128")
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def write(path: Path, text: str) -> Path:
@@ -332,8 +350,54 @@ def test_pdf_with_almost_no_text_is_rejected(tmp_path: Path, pdf_builder) -> Non
 
 
 def test_damaged_pdf_raises_parse_error(tmp_path: Path) -> None:
+    path = _write_bytes(tmp_path / "bad.pdf", b"%PDF-1.4 this is not really a pdf")
+    check_not_encrypted(path)  # a damaged file is not refused up front; it fails when parsed
     with pytest.raises(ParseError):
-        parse(_write_bytes(tmp_path / "bad.pdf", b"%PDF-1.4 this is not really a pdf"))
+        parse(path)
+
+
+def test_pdf_title_is_the_first_line_when_it_reads_as_a_title(tmp_path: Path, pdf_builder) -> None:
+    long_title = "Annual Safety Performance Report for the Northern Region Operations 2026"
+    doc = parse(_write_bytes(tmp_path / "report-final-v3.pdf", pdf_builder([[long_title, "", *BODY]])))
+    assert doc.title == long_title
+    assert all(long_title not in b.text for b in doc.blocks), "the title leaves the text"
+    # a title-case line directly followed by body text, with no blank line between them
+    doc = parse(_write_bytes(tmp_path / "r.pdf", pdf_builder([["Quarterly Incident Review", *BODY]])))
+    assert doc.title == "Quarterly Incident Review"
+
+
+def test_pdf_first_line_that_is_a_sentence_is_not_a_title(tmp_path: Path, pdf_builder) -> None:
+    doc = parse(_write_bytes(tmp_path / "site-notes.pdf", pdf_builder([[*BODY, "", *BODY]])))
+    assert doc.title == "Site notes"
+    doc = parse(_write_bytes(tmp_path / "short.pdf", pdf_builder([["All sites passed the audit.", "", *BODY]])))
+    assert doc.title == "Short"
+
+
+def test_pdf_metadata_title_wins(tmp_path: Path, pdf_builder) -> None:
+    doc = parse(_write_bytes(tmp_path / "x.pdf", pdf_builder([["Some Heading Line", "", *BODY]], title="Official")))
+    assert doc.title == "Official"
+    assert doc.blocks[0].text == "Some Heading Line", "a different first line stays in the text"
+
+
+def test_password_protected_pdf_is_refused(tmp_path: Path, pdf_builder) -> None:
+    path = _write_bytes(tmp_path / "locked.pdf", encrypted_pdf(pdf_builder([["Secret text for the test.", *BODY]])))
+    with pytest.raises(EncryptedFileError, match="password protected") as err:
+        check_not_encrypted(path)
+    assert err.value.code == "encrypted_file"
+    with pytest.raises(EncryptedFileError):
+        parse(path)
+    opens = _write_bytes(tmp_path / "open.pdf", encrypted_pdf(pdf_builder([["Readable text for the test.", *BODY]]), ""))
+    check_not_encrypted(opens)  # an empty user password opens it, so it is not refused
+    assert "Readable text" in parse(opens).blocks[0].text
+
+
+@pytest.mark.parametrize(("name", "label"), [("locked.docx", "Word"), ("locked.xlsx", "Excel")])
+def test_password_protected_office_file_is_refused(tmp_path: Path, name: str, label: str) -> None:
+    # An encrypted Office file is an OLE compound file with an "EncryptedPackage" stream.
+    data = bytes.fromhex("d0cf11e0a1b11ae1") + bytes(504) + "EncryptedPackage".encode("utf-16-le") + bytes(64)
+    with pytest.raises(EncryptedFileError, match=f"The {label} file is password protected"):
+        check_not_encrypted(_write_bytes(tmp_path / name, data))
+    check_not_encrypted(_write_bytes(tmp_path / "plain.docx", b"PK\x03\x04 not really a zip"))
 
 
 # -------------------------------------------------------------------------------------- plain text
@@ -412,9 +476,43 @@ def test_xlsx_sheets_and_values(tmp_path: Path) -> None:
     other.append(["10 to 49", "5%"])
     wb.save(str(tmp_path / "prices.xlsx"))
     doc = parse(tmp_path / "prices.xlsx")
-    assert [b.heading_path for b in doc.blocks] == [["Prices"], ["Discounts"]]
-    assert doc.blocks[0].text == "SKU | Price | Since\nFH-1 | 349 | 2026-01-15\nFH-2 | 19.5"
-    assert doc.blocks[1].text == "Units | Discount\n10 to 49 | 5%"
+    assert [(b.kind, b.text.splitlines()[0], b.heading_path) for b in doc.blocks] == [
+        ("heading", "Prices", ["Prices"]),
+        ("table", "SKU | Price | Since", ["Prices"]),
+        ("heading", "Discounts", ["Discounts"]),
+        ("table", "Units | Discount", ["Discounts"]),
+    ]
+    assert doc.blocks[1].text == "SKU | Price | Since\nFH-1 | 349 | 2026-01-15\nFH-2 | 19.5"
+    assert doc.blocks[3].text == "Units | Discount\n10 to 49 | 5%"
+
+
+def test_xlsx_hidden_sheets_are_left_out(tmp_path: Path) -> None:
+    wb = Workbook()
+    wb.active.title = "Public"
+    wb.active.append(["Item", "Price"])
+    wb.active.append(["Desk", 120])
+    for name, state in (("Salaries", "hidden"), ("Margins", "veryHidden")):
+        sheet = wb.create_sheet(name)
+        sheet.append(["Name", "Amount"])
+        sheet.append([f"secret {name}", 99000])
+        sheet.sheet_state = state
+    wb.save(str(tmp_path / "book.xlsx"))
+    doc = parse(tmp_path / "book.xlsx")
+    text = "\n".join(b.text for b in doc.blocks)
+    assert "Desk" in text and "secret" not in text
+    assert {tuple(b.heading_path) for b in doc.blocks} == {("Public",)}, "a named sheet keeps its heading"
+    everything = parse(tmp_path / "book.xlsx", skip_hidden_sheets=False)
+    assert "secret Salaries" in "\n".join(b.text for b in everything.blocks)
+
+
+def test_xlsx_with_only_hidden_data_is_empty(tmp_path: Path) -> None:
+    wb = Workbook()
+    hidden = wb.create_sheet("Hidden data")
+    hidden.append(["a", "b"])
+    hidden.sheet_state = "hidden"
+    wb.save(str(tmp_path / "hidden.xlsx"))
+    with pytest.raises(EmptyDocumentError, match="no visible sheet"):
+        parse(tmp_path / "hidden.xlsx")
 
 
 def test_xlsx_single_default_sheet_has_no_path(tmp_path: Path) -> None:

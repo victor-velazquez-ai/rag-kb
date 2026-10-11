@@ -1,11 +1,14 @@
 """Shared test fixtures: a temporary data folder, the real stores on it, the fake embedder and the pipeline.
 
-Everything is offline: FakeEmbedder (deterministic hashed bag of words) stands in for the model.
+Everything is offline: FakeEmbedder (deterministic hashed bag of words) stands in for the model, and the
+reranker (on by default, a 90 MB download) is off. A test that needs a real model is live: it runs only
+with RAGKB_LIVE_TESTS=1.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -14,11 +17,31 @@ from ragkb.config import Settings
 from ragkb.ingest.parsers import SUPPORTED_SUFFIXES
 from ragkb.ingest.pipeline import IngestPipeline
 from ragkb.models import Collection
+from ragkb.retrieval import reranker as reranker_module
 from ragkb.retrieval.embedder import FakeEmbedder
 from ragkb.store.lancedb_store import LanceDBStore
 from ragkb.store.sqlite_meta import SQLiteMeta
 
 SAMPLE_CORPUS = Path(__file__).resolve().parents[1] / "samples" / "corpus"
+LIVE_TESTS = os.environ.get("RAGKB_LIVE_TESTS") == "1"
+
+
+@pytest.fixture(autouse=True)
+def no_reranker_download(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every test runs with RAGKB_RERANKER=none unless it sets the variable itself. Outside live runs, a
+    test that still tries to load the real cross-encoder fails, even though the reranker would quietly
+    fall back to the fused order: a test that stands in for the model patches TextCrossEncoder itself."""
+    monkeypatch.setenv("RAGKB_RERANKER", "none")
+    attempts: list[str] = []
+    if not LIVE_TESTS:
+
+        def refuse(model_name: str, *args: object, **kwargs: object) -> None:
+            attempts.append(model_name)
+            raise RuntimeError("offline tests do not load the reranker model")
+
+        monkeypatch.setattr(reranker_module, "TextCrossEncoder", refuse)
+    yield
+    assert not attempts, f"an offline test tried to load the reranker model {attempts}; mark it live"
 
 
 def _pdf_escape(text: str) -> str:
@@ -72,7 +95,8 @@ def pdf_builder() -> Callable[..., bytes]:
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    s = Settings(_env_file=None, DATA_DIR=tmp_path / "data", CHUNK_TOKENS=350, CHUNK_OVERLAP_TOKENS=60)
+    s = Settings(_env_file=None, DATA_DIR=tmp_path / "data", CHUNK_TOKENS=350, CHUNK_OVERLAP_TOKENS=60,
+                 RERANKER="none")
     s.ensure_dirs()
     return s
 
@@ -114,6 +138,6 @@ def indexed_corpus(pipeline: IngestPipeline, collection: Collection, sample_corp
     """The whole sample corpus ingested into ``collection``."""
     for path in sorted(sample_corpus_dir.iterdir()):
         if path.suffix.lower() in SUPPORTED_SUFFIXES:
-            doc = pipeline.ingest_file(collection.id, path)
+            doc = pipeline.ingest_file(collection.id, path).document
             assert doc.status.value == "ready", (path.name, doc.error)
     return collection

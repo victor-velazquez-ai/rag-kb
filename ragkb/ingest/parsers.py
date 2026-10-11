@@ -11,9 +11,17 @@ format has pages, and the media type. Conventions shared by all formats:
 - Tables become one block of kind "table": one line per row, cells joined by " | ", header row first.
   CSV and Excel produce one table block per group of rows, each repeating the header row.
 - Lists become one block of kind "list" with one item per line.
+- Excel: every sheet starts with a heading block holding the sheet name, which also heads the
+  ``heading_path`` of its rows, so a workbook never merges into one anonymous block (a workbook whose
+  only sheet has a default name such as "Sheet1" keeps no heading). Hidden sheets are left out unless
+  ``skip_hidden_sheets`` is false.
+- PDF titles: the document properties title, else the first line of the first page when it reads as a
+  title (short, and not a sentence), else one made from the file name.
 
 Failures raise UnsupportedFileTypeError, EmptyDocumentError or ParseError, each with a plain message
-that is safe to show to the person who uploaded the file.
+that is safe to show to the person who uploaded the file. ``check_not_encrypted`` (a file on disk) and
+``check_data_not_encrypted`` (bytes in memory, such as an upload) raise EncryptedFileError for a
+password-protected PDF, Word or Excel file, so a caller can refuse it before doing any work.
 """
 
 from __future__ import annotations
@@ -114,6 +122,14 @@ class ParseError(IngestError):
     code = "parse_error"
 
 
+class FileTooLargeError(IngestError):
+    code = "file_too_large"
+
+
+class EncryptedFileError(IngestError):
+    code = "encrypted_file"
+
+
 @dataclass
 class ParsedDocument:
     title: str
@@ -148,7 +164,7 @@ def title_from_filename(filename: str) -> str:
     return text
 
 
-def parse(path: Path, media_type: str | None = None) -> ParsedDocument:
+def parse(path: Path, media_type: str | None = None, *, skip_hidden_sheets: bool = True) -> ParsedDocument:
     """Parse one file into blocks. Raises UnsupportedFileTypeError, EmptyDocumentError or ParseError."""
     path = Path(path)
     media_type = media_type or media_type_for(path.name)
@@ -156,8 +172,9 @@ def parse(path: Path, media_type: str | None = None) -> ParsedDocument:
     if handler is None:
         raise UnsupportedFileTypeError(unsupported_message(path.name))
     label = _FORMAT_LABELS.get(media_type or "", "")
+    options: dict[str, Any] = {"skip_hidden": skip_hidden_sheets} if media_type == XLSX else {}
     try:
-        title, blocks, pages = handler(path)
+        title, blocks, pages = handler(path, **options)
     except IngestError:
         raise
     except Exception as exc:  # any library failure becomes one plain message
@@ -170,6 +187,52 @@ def parse(path: Path, media_type: str | None = None) -> ParsedDocument:
         raise EmptyDocumentError("The file contains no readable text.")
     title = _clean_title(title) or title_from_filename(path.name)
     return ParsedDocument(title=title, blocks=blocks, pages=pages, media_type=media_type or "")
+
+
+# An encrypted Word or Excel file is an OLE compound file holding an "EncryptedPackage" stream.
+_OLE_MAGIC = bytes.fromhex("d0cf11e0a1b11ae1")
+_ENCRYPTED_PACKAGE = "EncryptedPackage".encode("utf-16-le")
+
+
+def check_not_encrypted(path: Path, media_type: str | None = None) -> None:
+    """Raise EncryptedFileError when a PDF, Word or Excel file is password protected. A damaged file
+    passes; it fails later, when it is parsed."""
+    path = Path(path)
+    media_type = media_type or media_type_for(path.name)
+    if media_type == PDF:
+        check_data_not_encrypted(path.read_bytes(), media_type)
+    elif media_type in (DOCX, XLSX):
+        with path.open("rb") as handle:
+            head = handle.read(len(_OLE_MAGIC))
+        if head == _OLE_MAGIC:
+            check_data_not_encrypted(path.read_bytes(), media_type)
+
+
+def check_data_not_encrypted(data: bytes, media_type: str | None) -> None:
+    """``check_not_encrypted`` for bytes already in memory, such as an upload before it is queued."""
+    if media_type == PDF:
+        try:
+            locked = _pdf_locked(PdfReader(io.BytesIO(data)))
+        except Exception:  # noqa: BLE001 - a damaged PDF is reported by the parser
+            return
+        if locked:
+            raise EncryptedFileError("The PDF is password protected. Remove the password and upload it again.")
+    elif media_type in (DOCX, XLSX):
+        if data[: len(_OLE_MAGIC)] == _OLE_MAGIC and _ENCRYPTED_PACKAGE in data:
+            label = _FORMAT_LABELS[media_type]
+            raise EncryptedFileError(
+                f"The {label} file is password protected. Remove the password and upload it again."
+            )
+
+
+def _pdf_locked(reader: PdfReader) -> bool:
+    """True when the PDF is encrypted with a password (an empty user password opens it)."""
+    if not reader.is_encrypted:
+        return False
+    try:
+        return not bool(reader.decrypt(""))
+    except Exception:  # noqa: BLE001 - any decryption failure means locked
+        return True
 
 
 # --------------------------------------------------------------------------------------------------
@@ -664,13 +727,8 @@ def _parse_pdf(path: Path) -> tuple[str, list[Block], int | None]:
         reader = PdfReader(str(path))
     except Exception as exc:
         raise ParseError("The PDF could not be opened. It may be damaged.") from exc
-    if reader.is_encrypted:
-        try:
-            unlocked = bool(reader.decrypt(""))
-        except Exception:  # noqa: BLE001 - any decryption failure means locked
-            unlocked = False
-        if not unlocked:
-            raise ParseError("The PDF is password protected. Remove the password and upload it again.")
+    if _pdf_locked(reader):
+        raise EncryptedFileError("The PDF is password protected. Remove the password and upload it again.")
     raw_pages: list[str] = []
     for page in reader.pages:
         try:
@@ -684,21 +742,26 @@ def _parse_pdf(path: Path) -> tuple[str, list[Block], int | None]:
     if chars < 20 or chars < 10 * max(page_count, 1):
         raise EmptyDocumentError(_SCANNED_MESSAGE)
 
-    items = [
-        (number, kind, text)
-        for number, lines in enumerate(page_lines, start=1)
-        for kind, text in _pdf_paragraphs(lines)
-    ]
     try:
         meta_title = _one_line((reader.metadata.title if reader.metadata else None) or "")
     except Exception:  # noqa: BLE001 - unreadable metadata only costs the title
         meta_title = ""
     title = meta_title if meta_title and not _BAD_PDF_TITLES.search(meta_title) else ""
-    # a leading heading is the document title when the metadata has none or says the same
-    if items and items[0][1] == "heading" and (not title or items[0][2].lower() == title.lower()):
-        title = title or items[0][2]
-        items = items[1:]
+    # The first line of the first page is the document title when it reads as one and the metadata
+    # has no title or says the same; it then leaves the text, so passages do not repeat it.
+    found = _pdf_title_line(page_lines)
+    if found is not None:
+        page_index, line_index = found
+        line = page_lines[page_index][line_index]
+        if not title or line.lower() == title.lower():
+            title = title or line
+            page_lines[page_index] = page_lines[page_index][:line_index] + page_lines[page_index][line_index + 1 :]
 
+    items = [
+        (number, kind, text)
+        for number, lines in enumerate(page_lines, start=1)
+        for kind, text in _pdf_paragraphs(lines)
+    ]
     sink = _Sink(title_from_first_h1=False)
     for number, kind, text in items:
         if kind == "heading":
@@ -706,6 +769,47 @@ def _parse_pdf(path: Path) -> tuple[str, list[Block], int | None]:
         else:
             sink.add(text, kind=kind, page=number)
     return title, sink.blocks, page_count
+
+
+_TITLE_MAX_CHARS = 120
+_TITLE_MAX_WORDS = 20
+_LETTER = re.compile(r"[^\W\d_]")
+_LONG_WORD = re.compile(r"[^\W\d_]{4,}")
+
+
+def _pdf_title_line(page_lines: list[list[str]]) -> tuple[int, int] | None:
+    """(page index, line index) of the first line of the first page with text, when that line reads as
+    a title and the document has text after it; None otherwise.
+
+    It reads as a title when it is short (under 120 characters and 20 words), has letters, does not
+    start in lower case or end like a sentence or a broken word, is not a list item, and either stands
+    alone as a paragraph (the next line starts a new one) or is written in title case."""
+    page_index = next((i for i, lines in enumerate(page_lines) if any(lines)), None)
+    if page_index is None:
+        return None
+    lines = page_lines[page_index]
+    line_index = next(i for i, line in enumerate(lines) if line)
+    line = lines[line_index]
+    has_more = any(lines[line_index + 1 :]) or any(any(rest) for rest in page_lines[page_index + 1 :])
+    if not has_more or not _title_like(line):
+        return None
+    groups = _pdf_paragraphs(lines[line_index:])
+    stands_alone = bool(groups) and groups[0][1] == line
+    return (page_index, line_index) if stands_alone or _title_case(line) else None
+
+
+def _title_like(line: str) -> bool:
+    if len(line) >= _TITLE_MAX_CHARS or len(line.split()) > _TITLE_MAX_WORDS or not _LETTER.search(line):
+        return False
+    if line[0].islower() or line[-1] in ".,;:!?-":
+        return False
+    return not (_LIST_ITEM.match(line) and not _NUMBERED_HEADING.match(line))
+
+
+def _title_case(line: str) -> bool:
+    """Most words of four letters or more start with a capital, as in "Annual Safety Report"."""
+    words = _LONG_WORD.findall(line)
+    return len(words) >= 2 and sum(w[0].isupper() for w in words) >= 0.7 * len(words)
 
 
 def _pdf_lines(text: str) -> list[str]:
@@ -871,22 +975,36 @@ def _parse_delimited(path: Path, delimiter: str | None) -> tuple[str, list[Block
     return "", _row_group_blocks(rows, heading_path=[]), None
 
 
-def _parse_xlsx(path: Path) -> tuple[str, list[Block], int | None]:
+def _parse_xlsx(path: Path, skip_hidden: bool = True) -> tuple[str, list[Block], int | None]:
     workbook = load_workbook(str(path), read_only=True, data_only=True)
+    hidden: list[str] = []
     try:
         sheets: list[tuple[str, list[list[str]]]] = []
         for sheet in workbook.worksheets:
+            if skip_hidden and getattr(sheet, "sheet_state", "visible") != "visible":
+                hidden.append(sheet.title)
+                continue
             rows = [[_format_cell(v) for v in values] for values in sheet.iter_rows(values_only=True)]
             if any(any(row) for row in rows):
                 sheets.append((sheet.title, rows))
         title = workbook.properties.title or ""
     finally:
         workbook.close()
+    if hidden:
+        log.info("left out %d hidden sheet(s) of %s", len(hidden), path.name)
+    if not sheets and hidden:
+        raise EmptyDocumentError(
+            "This workbook has no visible sheet with data. Hidden sheets are not indexed; "
+            "unhide the sheets to index them."
+        )
+    anonymous = len(sheets) == 1 and re.fullmatch(r"sheet\s*\d*", sheets[0][0].strip(), re.IGNORECASE)
     blocks: list[Block] = []
     for name, rows in sheets:
-        default_name = re.fullmatch(r"sheet\s*\d*", name.strip(), re.IGNORECASE) is not None
-        path_ = [] if default_name and len(sheets) == 1 else [name]
-        blocks.extend(_row_group_blocks(rows, heading_path=path_))
+        if anonymous:
+            blocks.extend(_row_group_blocks(rows, heading_path=[]))
+            continue
+        blocks.append(Block(text=name, heading_path=[name], kind="heading"))
+        blocks.extend(_row_group_blocks(rows, heading_path=[name]))
     return title, blocks, None
 
 
