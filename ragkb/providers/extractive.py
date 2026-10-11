@@ -12,13 +12,20 @@ from ragkb.answer.citations import content_tokens, coverage, guess_language, tok
 from ragkb.answer.prompts import DIGEST_BULLET, DIGEST_LEAD, DIGEST_PAGE_WORD, DIGEST_THIN
 from ragkb.models import Hit, ProviderStatus
 from ragkb.providers.base import ProviderError, ProviderResult
+from ragkb.retrieval.base import best_relevance, exact_pattern, exact_terms, ranked_only, relevance_of
 
-# When to answer. Fused scores alone cannot decline (hybrid search returns its top matches for any
-# question), so the passages must also be about the question. Each topic word of the question weighs
-# by its rarity across the retrieved passages, an IDF weight 1 + ln((1 + N) / (1 + df)) where df counts
-# the passages that contain it: a generic word found in most passages ("company", "year", "office")
-# weighs little, a specific one ("CCTV", "probation") a lot, and a word no passage contains weighs the
-# most. The rules, all required:
+# When to answer. The retrieval scores decide first: the retriever judges every passage against the
+# calibrated bands of its models (ragkb.retrieval.base: the best rerank score, and the best cosine of
+# a calibrated embedding model). A strong passage means answer, every passage weak means decline. A
+# missing question word no longer blocks a strong match ("money for working from home" against "a home
+# office allowance").
+#
+# Between the two (a borderline best passage), and when no score is calibrated (an unknown model, the
+# offline test embedder), a lexical check breaks the tie: the passages must be about the question. Each
+# topic word of the question weighs by its rarity across the retrieved passages, an IDF weight
+# 1 + ln((1 + N) / (1 + df)) where df counts the passages that contain it: a generic word found in most
+# passages ("company", "year", "office") weighs little, a specific one ("CCTV", "probation") a lot, and
+# a word no passage contains weighs the most. The rules, all required:
 # 1. The best fused score reaches EXTRACTIVE_MIN_SCORE (RRF scores: 1 / (60 + rank + 1) per list).
 EXTRACTIVE_MIN_SCORE = 0.01
 # 2. The rarest words are covered: a topic word that no passage contains is tolerated only once per
@@ -36,6 +43,13 @@ MAX_BULLETS = 5
 MAX_SENTENCES_PER_BULLET = 2
 MIN_SENTENCE_CHARS = 12
 MAX_SENTENCE_CHARS = 320
+# A unit this short, with no digit and no closing punctuation, is a label or a heading ("Health
+# insurance"), not a sentence worth quoting.
+MIN_LABEL_WORDS = 4
+# A document gets a bullet only when its best sentence carries at least this share of the weight of the
+# best sentence overall, so a passage that shares one generic word ("covers") with the question does
+# not add a bullet.
+DIGEST_MIN_RELATIVE_WEIGHT = 0.5
 
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[\"'(\[¿¡]?[A-Z0-9ÁÉÍÓÚÑÀÈÌÒÙÂÊÎÔÛÄÖÜÇ])")
 _LIST_MARK = re.compile(r"^(?:[-*+•]|\d{1,3}[.)])\s+")
@@ -95,7 +109,20 @@ def _units(text: str) -> list[str]:
             continue
         prose.append(line)
     flush()
-    return [_finish(_clip(" ".join(unit.split()))) for unit in out if len(unit.strip()) >= MIN_SENTENCE_CHARS]
+    return [
+        _finish(_clip(" ".join(unit.split())))
+        for unit in out
+        if len(unit.strip()) >= MIN_SENTENCE_CHARS and not _is_label(unit)
+    ]
+
+
+def _is_label(unit: str) -> bool:
+    text = unit.strip()
+    return (
+        len(text.split()) < MIN_LABEL_WORDS
+        and not any(ch.isdigit() for ch in text)
+        and text[-1:] not in ".!?"
+    )
 
 
 def _finish(sentence: str) -> str:
@@ -147,7 +174,22 @@ class ExtractiveProvider:
     # -- assessment -------------------------------------------------------------------------------
 
     def is_answerable(self, question: str, hits: list[Hit]) -> bool:
-        """True when the passages are about the question, by the four rules at the top of this module."""
+        """True when the passages answer the question: a strong passage answers, all weak declines, and
+        otherwise the lexical rules at the top of this module decide. Passages attached as context never
+        count."""
+        ranked = ranked_only(hits)
+        if not ranked:
+            return False
+        level = best_relevance(ranked)
+        if level == "strong":
+            return True
+        if level == "weak":
+            return False
+        return self.is_about(question, ranked)
+
+    def is_about(self, question: str, hits: list[Hit]) -> bool:
+        """The lexical check: True when the passages are about the question, by the four rules at the
+        top of this module."""
         if not hits:
             return False
         if max(hit.score for hit in hits) < EXTRACTIVE_MIN_SCORE:
@@ -178,14 +220,20 @@ class ExtractiveProvider:
             language = "en"
         question_tokens = content_tokens(question, guess_language(question))
         qset = set(question_tokens)
+        exact = [exact_pattern(term) for term in exact_terms(question)]
         weights = term_weights(
             question_tokens, [token_set(f"{hit.chunk.title} {hit.chunk.section} {hit.chunk.text}") for hit in hits]
         )
 
-        # Group candidate sentences by document, documents in rank order of their first hit.
+        # Group candidate sentences by document, documents in rank order of their first hit. Passages the
+        # calibrated scores call weak stay out when a better one exists.
+        levels = [relevance_of(hit) for hit in hits]
+        drop_weak = any(level in ("strong", "borderline") for level in levels)
         by_doc: dict[str, list[_Sentence]] = {}
         doc_hit: dict[str, int] = {}
         for index, hit in enumerate(hits):
+            if drop_weak and levels[index] == "weak":
+                continue
             doc_id = hit.chunk.doc_id
             doc_hit.setdefault(doc_id, index)
             bucket = by_doc.setdefault(doc_id, [])
@@ -196,28 +244,42 @@ class ExtractiveProvider:
                                         sum(weights[t] for t in matched)))
 
         any_overlap = any(s.overlap for sentences in by_doc.values() for s in sentences)
+        top_weight = max((s.weight for sentences in by_doc.values() for s in sentences), default=0.0)
         bullets: list[str] = []
         covered: set[str] = set()
+        # Once the lead bullet quotes an identifier or quoted phrase from the question, other documents
+        # contribute only sentences that hold one too.
+        exact_lead = False
         for doc_id in sorted(by_doc, key=lambda d: doc_hit[d]):
             if len(bullets) >= MAX_BULLETS:
                 break
             sentences = by_doc[doc_id]
+            if exact_lead:
+                sentences = [s for s in sentences if any(pattern.search(s.text) for pattern in exact)]
             if not sentences:
                 continue
             ranked = sorted(sentences, key=lambda s: (-s.weight, s.hit_index, s.position))
             best = ranked[0]
             if any_overlap and best.overlap == 0:
                 continue
+            if bullets and best.weight < DIGEST_MIN_RELATIVE_WEIGHT * top_weight:
+                continue
             chosen = [best]
+            # When the best sentence holds an identifier or quoted phrase from the question, a second
+            # sentence must hold one too: the next row of a price list shares the code's prefix only.
+            needs_exact = any(pattern.search(best.text) for pattern in exact)
             for candidate in ranked[1:]:
                 if len(chosen) >= MAX_SENTENCES_PER_BULLET:
                     break
+                if needs_exact and not any(pattern.search(candidate.text) for pattern in exact):
+                    continue
                 if candidate.overlap >= max(1, best.overlap - 1) and candidate.text != best.text:
                     chosen.append(candidate)
             chosen.sort(key=lambda s: (s.hit_index, s.position))
             for sentence in chosen:
                 covered |= qset & sentence.tokens
             bullets.append(self._bullet(hits[doc_hit[doc_id]], chosen, language))
+            exact_lead = exact_lead or (len(bullets) == 1 and needs_exact)
             if not any_overlap and len(bullets) >= 3:
                 break
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,8 +10,13 @@ from concurrent.futures import ThreadPoolExecutor
 from ragkb.config import Settings
 from ragkb.models import ProviderStatus
 from ragkb.providers.base import Provider, ProviderError
-from ragkb.providers.claude_code import ClaudeCodeProvider
-from ragkb.providers.codex import CodexProvider
+from ragkb.providers.claude_code import MODEL_NAME_RE, ClaudeCodeProvider
+from ragkb.providers.codex import (
+    CodexProvider,
+    ModelNotAvailableError,
+    accepted_models,
+    model_not_available_message,
+)
 from ragkb.providers.extractive import ExtractiveProvider
 
 logger = logging.getLogger(__name__)
@@ -18,6 +24,9 @@ logger = logging.getLogger(__name__)
 PROVIDER_ORDER = ("claude_code", "codex", "extractive")
 AUTO = "auto"
 STATUS_TTL_S = 30.0
+# Claude Code takes its aliases (sonnet, opus, haiku, with an optional suffix such as [1m]) and full
+# model ids, which all start with "claude-".
+_CLAUDE_ALIAS_SUFFIX = re.compile(r"\[[A-Za-z0-9]+\]$")
 
 
 class ProviderRegistry:
@@ -75,14 +84,16 @@ class ProviderRegistry:
 
     # -- selection --------------------------------------------------------------------------------
 
-    def select(self, name: str | None = None) -> Provider:
+    def select(self, name: str | None = None, *, model: str | None = None) -> Provider:
         """`None` means the configured default (RAGKB_PROVIDER, `auto` unless set). `auto` picks the first
         signed-in of claude_code and codex, else extractive. A named provider that is not usable raises
         ProviderError(not_installed | not_signed_in) with its fix command; an unknown name raises
-        ValueError."""
+        ValueError. With *model*, a model the chosen provider does not know raises
+        ModelNotAvailableError (a ProviderError of kind failed) before any call."""
         wanted = (name or self._settings.PROVIDER or AUTO).strip().lower()
         if wanted == AUTO:
             provider, reason = self._auto()
+            self.check_model(provider.name, model)
             logger.info("provider selected: %s (%s)", provider.name, reason)
             return provider
         if wanted not in self._providers:
@@ -97,8 +108,33 @@ class ProviderRegistry:
             raise ProviderError(
                 "not_signed_in", f"{_display(provider)} is not signed in.", fix_command=status.fix_command
             )
+        self.check_model(wanted, model)
         logger.info("provider selected: %s (requested)", wanted)
         return provider
+
+    def check_model(self, name: str, model: str | None) -> None:
+        """Refuse, before any call, a model the provider does not know: the message names the model and
+        lists the ones it knows. Claude Code knows its aliases and every claude- model id; Codex knows
+        the models its own config and model cache list (nothing is refused when it lists none). The
+        extractive provider has no model, so a model given for it is ignored."""
+        wanted = (model or "").strip()
+        if not wanted or name == "extractive" or name not in self._providers:
+            return
+        display = _display(self._providers[name])
+        if not MODEL_NAME_RE.match(wanted):
+            raise ModelNotAvailableError(f"{wanted[:40]} is not a valid model name for {display}.")
+        known = list(self.status_of(name).models)
+        if name == "claude_code":
+            alias = _CLAUDE_ALIAS_SUFFIX.sub("", wanted).lower()
+            accepted = alias in {m.lower() for m in known} or wanted.lower().startswith("claude-")
+        elif name == "codex":
+            confirmed = accepted_models() | set(known)
+            accepted = not confirmed or wanted in confirmed
+        else:
+            accepted = not known or wanted in known
+        if not accepted:
+            logger.info("model refused before the call: provider=%s", name)
+            raise ModelNotAvailableError(model_not_available_message(display, wanted, known))
 
     def _auto(self) -> tuple[Provider, str]:
         statuses = {status.name: status for status in self.statuses()}

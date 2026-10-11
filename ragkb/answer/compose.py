@@ -1,8 +1,12 @@
 """Passages + question + provider -> the Answer contract (docs/ARCHITECTURE.md section 5).
 
 The passage budget is applied once and only kept passages are numbered, so a dropped passage can never
-be cited. A decline is an exact sentinel turned into a status, never text that reads like an answer.
-Logs carry counts, statuses and timings only, never the question's passages or the answer text.
+be cited. Passages attached as context (``neighbour_of``) get budget only after every ranked passage
+that fits, and sit right after their anchor. A decline is an exact sentinel turned into a status, never
+text that reads like an answer; with it, ``closest`` lists the best passages so the person can judge.
+When a reranker scored the passages and every one is weak by its calibrated band, the decline is made
+without spending a model call. Logs carry counts, statuses and timings only, never the question's
+passages or the answer text.
 """
 from __future__ import annotations
 
@@ -11,12 +15,19 @@ import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from ragkb.answer.citations import densify, extract_markers, guess_language
-from ragkb.answer.prompts import NO_ANSWER, PASSAGE_SEPARATOR, SYSTEM_PROMPT, render_passage, render_prompt
+from ragkb.answer.citations import closest, densify, extract_markers, guess_language
+from ragkb.answer.prompts import (
+    NO_ANSWER,
+    PASSAGE_SEPARATOR,
+    SYSTEM_PROMPT,
+    render_passage,
+    render_prompt,
+)
 from ragkb.config import Settings
 from ragkb.models import Answer, AnswerStatus, Citation, Hit, ProviderInfo
 from ragkb.providers.base import Provider, ProviderError
 from ragkb.providers.extractive import ExtractiveProvider
+from ragkb.retrieval.base import best_relevance, is_neighbour, ranked_only
 
 logger = logging.getLogger(__name__)
 
@@ -57,16 +68,42 @@ def is_no_answer(text: str) -> bool:
 
 
 def build_prompt(question: str, hits: list[Hit], max_context_chars: int) -> tuple[str, list[Hit]]:
-    """The user prompt with numbered passages, and the hits it contains. Whole passages are kept in rank
-    order while their rendered blocks fit *max_context_chars*; the first always fits."""
-    kept: list[Hit] = []
-    used = 0
+    """The user prompt with numbered passages, and the hits it contains, in prompt order.
+
+    Ranked passages are kept whole, in rank order, while their rendered blocks fit *max_context_chars*;
+    the first always fits. Passages attached as context then take what is left, each only if it fits
+    and only when its anchor was kept, and each is placed right after its anchor."""
+    ranked = ranked_only(hits)
+    attached: dict[str, list[Hit]] = {}
     for hit in hits:
-        cost = len(render_passage(len(kept) + 1, hit)) + (len(PASSAGE_SEPARATOR) if kept else 0)
-        if kept and used + cost > max_context_chars:
+        if is_neighbour(hit):
+            attached.setdefault(str(getattr(hit, "neighbour_of", "")), []).append(hit)
+
+    separator = len(PASSAGE_SEPARATOR)
+    kept_ranked: list[Hit] = []
+    used = 0
+    for hit in ranked:
+        cost = len(render_passage(len(kept_ranked) + 1, hit)) + (separator if kept_ranked else 0)
+        if kept_ranked and used + cost > max_context_chars:
             break
-        kept.append(hit)
+        kept_ranked.append(hit)
         used += cost
+
+    widest = int("9" * len(str(max(1, len(hits)))))
+    extras: dict[str, list[Hit]] = {}
+    for anchor in kept_ranked:
+        for hit in attached.get(anchor.chunk.id, []):
+            context = f"the text just before [{widest}]"
+            cost = len(render_passage(widest, hit, context=context)) + separator
+            if used + cost > max_context_chars:
+                continue
+            extras.setdefault(anchor.chunk.id, []).append(hit)
+            used += cost
+
+    kept: list[Hit] = []
+    for anchor in kept_ranked:
+        kept.append(anchor)
+        kept.extend(sorted(extras.get(anchor.chunk.id, []), key=lambda h: h.chunk.ordinal))
     return render_prompt(question, kept), kept
 
 
@@ -90,7 +127,10 @@ def _answer(
     answer: str | None = None,
     message: str | None = None,
     citations: list[Citation] | None = None,
+    closest_to: list[Hit] | None = None,
 ) -> Answer:
+    """Assemble the contract. *closest_to* are the hits a decline lists as ``closest`` (only when the
+    status is no_answer)."""
     return Answer(
         id=uuid4().hex,
         question=question,
@@ -99,6 +139,7 @@ def _answer(
         answer=answer if status == AnswerStatus.answered else None,
         message=None if status == AnswerStatus.answered else message,
         citations=citations or [],
+        closest=closest(closest_to or []) if status == AnswerStatus.no_answer else [],
         passages_considered=passages_considered,
         provider=provider,
         knowledge_version=knowledge_version,
@@ -114,7 +155,10 @@ def _not_covered(has_documents: bool) -> tuple[AnswerStatus, str]:
 
 
 def error_message(error: ProviderError, provider_label: str, timeout_s: int | None = None) -> tuple[AnswerStatus, str]:
-    """The status and the plain sentence for a provider failure."""
+    """The status and the plain sentence for a provider failure. An error marked ``show_message`` (a
+    model the provider does not know, where trying again cannot help) shows its own sentence."""
+    if getattr(error, "show_message", False) and error.message:
+        return AnswerStatus.provider_unavailable, error.message
     if error.kind == "not_signed_in":
         key = "not_signed_in" if error.fix_command else "not_signed_in_no_fix"
         return AnswerStatus.provider_unavailable, MESSAGES[key].format(
@@ -152,8 +196,9 @@ def compose(
     """Compose the answer for *question* from *hits* (already ranked) with *provider*.
 
     Zero hits never reach a model: the status is no_documents or no_answer straight away. The extractive
-    provider writes a digest instead of calling a model. Provider failures become statuses with a plain
-    message; they are never raised.
+    provider writes a digest instead of calling a model. When a reranker scored the passages and every
+    one is weak, the decline comes before any model call. Provider failures become statuses with a
+    plain message; they are never raised. Every no_answer lists the closest passages.
     """
     started = time.monotonic()
     label = _display(provider)
@@ -172,12 +217,20 @@ def compose(
         if not answerable:
             status, message = _not_covered(has_documents)
             _log(status, provider.name, None, elapsed, len(hits), len(hits), 0)
-            return _answer(question, status=status, message=message, provider=info, **common)
+            return _answer(question, status=status, message=message, provider=info, closest_to=hits, **common)
         text, citations = densify(provider.digest(question, hits), hits)
         info.elapsed_ms = _ms_since(started)
         _log(AnswerStatus.answered, provider.name, None, info.elapsed_ms, len(hits), len(hits), len(citations))
         return _answer(question, status=AnswerStatus.answered, answer=text, citations=citations,
                        provider=info, **common)
+
+    if weak_by_reranker(hits):
+        status, message = _not_covered(has_documents)
+        elapsed = _ms_since(started)
+        logger.info("compose: declined before the model call, every reranked passage is weak")
+        _log(status, provider.name, None, elapsed, len(hits), 0, 0)
+        return _answer(question, status=status, message=message, closest_to=hits,
+                       provider=ProviderInfo(name=provider.name, model=None, elapsed_ms=elapsed), **common)
 
     prompt, kept = build_prompt(question, hits, settings.MAX_CONTEXT_CHARS)
     try:
@@ -202,7 +255,7 @@ def compose(
     if not text or is_no_answer(text):
         status, message = _not_covered(has_documents)
         _log(status, provider.name, info.model, elapsed, len(hits), len(kept), 0)
-        return _answer(question, status=status, message=message, provider=info, **common)
+        return _answer(question, status=status, message=message, provider=info, closest_to=hits, **common)
 
     answer_text, citations = densify(text, kept)
     if not citations:
@@ -271,6 +324,15 @@ def compose_provider_error(
         passages_considered=passages_considered,
         provider=ProviderInfo(name=provider_name, model=model, elapsed_ms=0),
     )
+
+
+def weak_by_reranker(hits: list[Hit]) -> bool:
+    """True when a reranker scored the ranked passages and the calibrated bands call every one weak:
+    the knowledge base does not cover the question, so no model call is spent on it."""
+    ranked = ranked_only(hits)
+    if not any(hit.rerank_score is not None for hit in ranked):
+        return False
+    return best_relevance(ranked) == "weak"
 
 
 def _ms_since(started: float) -> int:

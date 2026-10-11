@@ -12,6 +12,7 @@ from typing import Any
 
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 
+from ragkb.config import Settings
 from ragkb.models import Hit
 
 log = logging.getLogger(__name__)
@@ -39,6 +40,11 @@ class LocalReranker:
         self._lock = threading.Lock()
         self._load_failed_at: float | None = None
         self._warned = False
+
+    def load(self) -> None:
+        """Load the model now (downloading it on the first run) instead of on the first search. Raises
+        when it cannot be loaded, so `ragkb doctor` can report why."""
+        self._get_model()
 
     def _get_model(self) -> Any:
         if self._model is not None:
@@ -76,3 +82,11 @@ class LocalReranker:
         ]
         order = sorted(range(len(rescored)), key=lambda i: (-scores[i], i))
         return [rescored[i] for i in order[:top_n]]
+
+
+def reranker_for(settings: Settings) -> LocalReranker | None:
+    """The reranker the settings ask for: the local cross-encoder when RERANKER is ``local``, else None
+    (search keeps the fused order). The model loads on first use."""
+    if settings.RERANKER == "local":
+        return LocalReranker(settings.RERANK_MODEL)
+    return None

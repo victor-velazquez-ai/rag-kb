@@ -49,8 +49,9 @@ def _one_line(value: str | None) -> str:
     return " ".join((value or "").split())
 
 
-def passage_header(n: int, hit: Hit) -> str:
-    """`[n] (Title, page X, Section)`, leaving out the parts the chunk does not have."""
+def passage_header(n: int, hit: Hit, *, context: str | None = None) -> str:
+    """`[n] (Title, page X, Section)`, leaving out the parts the chunk does not have. *context* is
+    appended for a passage attached to another one, like "the text just before [1]"."""
     chunk = hit.chunk
     title = _one_line(chunk.title) or "Untitled"
     parts = [title]
@@ -59,15 +60,31 @@ def passage_header(n: int, hit: Hit) -> str:
     section = _one_line(chunk.section)
     if section and section != title:
         parts.append(section)
+    if context:
+        parts.append(context)
     return f"[{n}] ({', '.join(parts)})"
 
 
-def render_passage(n: int, hit: Hit) -> str:
-    return f"{passage_header(n, hit)}\n{(hit.chunk.text or '').strip()}"
+def neighbour_context(hit: Hit, anchor: Hit, anchor_number: int) -> str:
+    """How a passage attached for context relates to its anchor, for its header."""
+    where = "before" if hit.chunk.ordinal < anchor.chunk.ordinal else "after"
+    return f"the text just {where} [{anchor_number}]"
+
+
+def render_passage(n: int, hit: Hit, *, context: str | None = None) -> str:
+    return f"{passage_header(n, hit, context=context)}\n{(hit.chunk.text or '').strip()}"
 
 
 def render_prompt(question: str, kept: list[Hit]) -> str:
-    passages = PASSAGE_SEPARATOR.join(render_passage(i + 1, hit) for i, hit in enumerate(kept))
+    numbers = {hit.chunk.id: i + 1 for i, hit in enumerate(kept)}
+    by_id = {hit.chunk.id: hit for hit in kept}
+    blocks = []
+    for i, hit in enumerate(kept):
+        anchor_id = getattr(hit, "neighbour_of", None)
+        anchor = by_id.get(anchor_id) if anchor_id else None
+        context = neighbour_context(hit, anchor, numbers[anchor.chunk.id]) if anchor is not None else None
+        blocks.append(render_passage(i + 1, hit, context=context))
+    passages = PASSAGE_SEPARATOR.join(blocks)
     return PROMPT_TEMPLATE.format(passages=passages, question=question.strip(), sentinel=NO_ANSWER)
 
 

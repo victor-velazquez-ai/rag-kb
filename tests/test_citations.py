@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import pytest
 
 from ragkb.answer.citations import (
+    closest,
     content_tokens,
     densify,
     extract_markers,
@@ -94,6 +95,34 @@ def test_densify_citation_fields():
     assert citation.page == 4 and citation.section == "Leave > Annual"
     assert citation.score == pytest.approx(0.0327)
     assert len(citation.snippet) <= 240 and citation.snippet.endswith("...")
+
+
+def test_densify_citations_carry_every_score_and_the_page_range():
+    hit = make_hit(1, score=0.031).model_copy(update={"vector_score": 0.71, "rerank_score": 2.5})
+    hit = hit.model_copy(update={"chunk": hit.chunk.model_copy(update={"page": 5, "page_start": 5, "page_end": 6})})
+    _, citations = densify("Answer [1].", [hit])
+    citation = citations[0]
+    assert (citation.score, citation.vector_score, citation.rerank_score) == (0.031, 0.71, 2.5)
+    assert (citation.page, citation.page_end) == (5, 6)
+    one_page = make_hit(2, page=7).model_copy(update={"chunk": make_hit(2, page=7).chunk.model_copy(
+        update={"page_start": 7, "page_end": 7})})
+    _, citations = densify("Answer [1].", [one_page])
+    assert (citations[0].page, citations[0].page_end) == (7, None)
+    no_page = make_hit(3).model_copy(update={"chunk": make_hit(3).chunk.model_copy(
+        update={"page": None, "page_start": 2, "page_end": 3})})
+    _, citations = densify("Answer [1].", [no_page])
+    assert (citations[0].page, citations[0].page_end) == (2, 3)
+
+
+def test_closest_numbers_the_best_passages_densely():
+    hits = [make_hit(n, text=f"Closest passage {n}.", score=0.03 - n / 1000) for n in range(1, 6)]
+    hits.insert(1, hits[0])
+    cited = closest(hits)
+    assert [c.marker for c in cited] == [1, 2, 3]
+    assert [c.chunk_id for c in cited] == [hits[0].chunk.id, hits[2].chunk.id, hits[3].chunk.id]
+    assert cited[0].snippet == "Closest passage 1." and cited[0].score == pytest.approx(0.029)
+    assert closest(hits, limit=1)[0].marker == 1
+    assert closest([]) == []
 
 
 def test_densify_with_no_markers():

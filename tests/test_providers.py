@@ -11,17 +11,27 @@ import pytest
 from ragkb.config import Settings
 from ragkb.models import ProviderStatus
 from ragkb.providers import claude_code as cc
+from ragkb.providers import codex as codex_module
 from ragkb.providers.base import ProviderError, ProviderResult
 from ragkb.providers.claude_code import (
     CLAUDE_EXTENSION,
     ClaudeCodeProvider,
+    CliRun,
     classify_error,
     diagnostic_text,
     find_binary,
     model_from_usage,
     vendor_message,
 )
-from ragkb.providers.codex import CODEX_EXTENSION, CodexProvider, known_models, parse_tokens_used
+from ragkb.providers.codex import (
+    CODEX_EXTENSION,
+    CodexProvider,
+    ModelNotAvailableError,
+    accepted_models,
+    is_unknown_model_error,
+    known_models,
+    parse_tokens_used,
+)
 from ragkb.providers.extractive import ExtractiveProvider
 from ragkb.providers.registry import ProviderRegistry
 from tests.fake_clis import FIXTURES, make_shim
@@ -293,6 +303,74 @@ def test_codex_models_come_from_the_cli_config_and_cache(tmp_path: Path, monkeyp
     assert known_models() == []
 
 
+def codex_home_with_models(tmp_path: Path) -> Path:
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    (home / "config.toml").write_text('model = "gpt-6-sol"\n', encoding="utf-8")
+    cache = {"models": [
+        {"slug": "gpt-6-sol", "visibility": "list", "priority": 1},
+        {"slug": "gpt-6-luna", "visibility": "list", "priority": 2},
+        {"slug": "gpt-5.5", "visibility": "hide", "priority": 3},
+    ]}
+    (home / "models_cache.json").write_text(json.dumps(cache), encoding="utf-8")
+    return home
+
+
+UNKNOWN_MODEL_OUTPUTS = [
+    ("Reading prompt from stdin...\nERROR: unexpected status 400 Bad Request: {\"detail\":\"The 'gpt-nope' model "
+    "is not supported when using Codex with a ChatGPT account.\"}\n"),
+    "ERROR: The model `gpt-nope` does not exist or you do not have access to it.",
+    "ERROR: {\"error\":{\"code\":\"model_not_found\",\"message\":\"no such model\"}}",
+    "error: unknown model 'gpt-nope'",
+]
+
+
+@pytest.mark.parametrize("stderr", UNKNOWN_MODEL_OUTPUTS)
+def test_codex_unknown_model_says_so_and_lists_the_known_models(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record: Path, stderr: str
+):
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_with_models(tmp_path)))
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return CliRun(returncode=1, stdout="", stderr=stderr, elapsed_ms=5000)
+
+    monkeypatch.setattr(codex_module, "run_cli", fake_run)
+    provider = CodexProvider(Settings(CODEX_BIN=str(make_shim(tmp_path / "bin", "codex", "fake_codex.py"))))
+    with pytest.raises(ProviderError) as err:
+        provider.generate(SYSTEM, PROMPT, timeout_s=30, model="gpt-nope")
+    assert isinstance(err.value, ModelNotAvailableError) and err.value.kind == "failed"
+    assert err.value.message == "Codex cannot use the model gpt-nope. Choose one of: gpt-6-sol, gpt-6-luna."
+    assert "try again" not in err.value.message.lower()
+    assert len(calls) == 1
+
+
+def test_codex_unknown_configured_model_without_a_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nothing"))
+    provider = CodexProvider(Settings(CODEX_BIN="codex"))
+    run = CliRun(returncode=1, stdout="", stderr=UNKNOWN_MODEL_OUTPUTS[0], elapsed_ms=10)
+    with pytest.raises(ModelNotAvailableError) as err:
+        provider.parse_run(run, None, PROMPT, None)
+    assert err.value.message == (
+        "Codex cannot use the model configured for it. Leave the model empty to use the Codex default."
+    )
+
+
+def test_other_codex_errors_are_not_mistaken_for_an_unknown_model():
+    assert not is_unknown_model_error("ERROR: You've hit your usage limit for gpt-6-sol. Try again in 2 hours.")
+    assert not is_unknown_model_error("ERROR: stream disconnected before completion")
+    assert not is_unknown_model_error("model_reasoning_effort is not supported for this request")
+    assert is_unknown_model_error("Unsupported model: gpt-nope")
+
+
+def test_codex_accepted_models_include_hidden_ones(tmp_path: Path):
+    home = codex_home_with_models(tmp_path)
+    assert known_models(home) == ["gpt-6-sol", "gpt-6-luna"]
+    assert accepted_models(home) == {"gpt-6-sol", "gpt-6-luna", "gpt-5.5"}
+    assert accepted_models(tmp_path / "missing") == set()
+
+
 def test_parse_tokens_used():
     stderr = (FIXTURES / "codex_success.stderr.txt").read_text(encoding="utf-8")
     assert parse_tokens_used(stderr) == 2756
@@ -404,20 +482,24 @@ def test_discovery_explicit_setting_that_points_nowhere(tmp_path: Path, monkeypa
 # ---------------------------------------------------------------------------------------------------
 
 class StubProvider:
-    def __init__(self, name: str, *, installed: bool = True, signed_in: bool = True, fix: str | None = None):
+    def __init__(self, name: str, *, installed: bool = True, signed_in: bool = True, fix: str | None = None,
+                 models: list[str] | None = None, display_name: str | None = None):
         self.name = name
-        self.display_name = name.title()
+        self.display_name = display_name or name.title()
         self.installed = installed
         self.signed_in = signed_in
         self.fix = fix
+        self.models = models or []
         self.status_calls = 0
+        self.generate_calls = 0
 
     def status(self) -> ProviderStatus:
         self.status_calls += 1
         return ProviderStatus(name=self.name, installed=self.installed, signed_in=self.signed_in,
-                              version="1.0", detail="stub", fix_command=self.fix, models=[])
+                              version="1.0", detail="stub", fix_command=self.fix, models=list(self.models))
 
     def generate(self, system: str, prompt: str, *, timeout_s: int, model: str | None = None) -> ProviderResult:
+        self.generate_calls += 1
         return ProviderResult(text="stub")
 
 
@@ -515,3 +597,53 @@ def test_registry_with_fake_clis_end_to_end(tmp_path: Path, record: Path, monkey
     assert statuses["claude_code"].installed and not statuses["claude_code"].signed_in
     assert statuses["codex"].signed_in
     assert registry.select().name == "codex"
+
+
+def _model_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, codex_models: list[str]) -> ProviderRegistry:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-codex-home"))
+    return _registry(
+        claude_code=StubProvider("claude_code", models=["sonnet", "opus", "haiku"], display_name="Claude Code"),
+        codex=StubProvider("codex", models=codex_models, display_name="Codex"),
+    )
+
+
+def test_registry_refuses_a_model_the_provider_does_not_know(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    registry = _model_registry(tmp_path, monkeypatch, codex_models=["gpt-6-sol", "gpt-6-luna"])
+    for model in ("sonnet", "opus[1m]", "claude-sonnet-5-5", " haiku "):
+        assert registry.select("claude_code", model=model).name == "claude_code"
+    with pytest.raises(ProviderError) as err:
+        registry.select("claude_code", model="gpt-6-sol")
+    assert isinstance(err.value, ModelNotAvailableError) and err.value.kind == "failed"
+    assert err.value.message == "Claude Code cannot use the model gpt-6-sol. Choose one of: sonnet, opus, haiku."
+    assert registry.select("codex", model="gpt-6-luna").name == "codex"
+    with pytest.raises(ModelNotAvailableError) as err:
+        registry.select("codex", model="sonnet")
+    assert err.value.message == "Codex cannot use the model sonnet. Choose one of: gpt-6-sol, gpt-6-luna."
+    with pytest.raises(ModelNotAvailableError) as err:
+        registry.select("codex", model="bad model!")
+    assert err.value.message == "bad model! is not a valid model name for Codex."
+    stubs = registry._providers
+    assert stubs["claude_code"].generate_calls == 0 and stubs["codex"].generate_calls == 0
+
+
+def test_registry_model_check_follows_the_auto_choice_and_ignores_extractive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    registry = _model_registry(tmp_path, monkeypatch, codex_models=["gpt-6-sol"])
+    with pytest.raises(ModelNotAvailableError) as err:
+        registry.select(None, model="gpt-6-sol")
+    assert err.value.message.startswith("Claude Code cannot use the model gpt-6-sol.")
+    assert registry.select("extractive", model="anything-1").name == "extractive"
+    assert registry.select("auto").name == "claude_code", "no model, nothing to check"
+
+
+def test_registry_codex_accepts_hidden_cached_models_and_anything_when_it_knows_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    registry = _model_registry(tmp_path, monkeypatch, codex_models=[])
+    assert registry.select("codex", model="gpt-7-new").name == "codex", "nothing known, nothing refused"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home_with_models(tmp_path)))
+    registry = _registry(codex=StubProvider("codex", models=["gpt-6-sol", "gpt-6-luna"], display_name="Codex"))
+    assert registry.select("codex", model="gpt-5.5").name == "codex", "a hidden model the cache confirms"
+    with pytest.raises(ModelNotAvailableError):
+        registry.select("codex", model="gpt-7-new")

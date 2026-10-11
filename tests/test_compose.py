@@ -1,4 +1,5 @@
-"""Answer composition: budget, sentinel, statuses, messages, citations and the extractive digest."""
+"""Answer composition: budget, sentinel, statuses, messages, citations, closest passages, the decline
+calibration, neighbour ordering and the extractive digest."""
 from __future__ import annotations
 
 import logging
@@ -14,13 +15,23 @@ from ragkb.answer.compose import (
     compose,
     compose_provider_error,
     compose_unavailable,
+    error_message,
     is_no_answer,
+    weak_by_reranker,
 )
 from ragkb.answer.prompts import NO_ANSWER, SYSTEM_PROMPT, passage_header
 from ragkb.config import Settings
 from ragkb.models import AnswerStatus, Chunk, Hit
 from ragkb.providers.base import ProviderError, ProviderResult
+from ragkb.providers.codex import ModelNotAvailableError
 from ragkb.providers.extractive import ExtractiveProvider
+from ragkb.retrieval.base import (
+    DEFAULT_RERANK_MODEL,
+    RankedHit,
+    classify,
+    cosine_band,
+    rerank_band,
+)
 
 SETTINGS = Settings(MAX_CONTEXT_CHARS=12000, ANSWER_TIMEOUT_S=180)
 
@@ -406,3 +417,271 @@ def test_extractive_handles_lists_and_tables():
     digest = ExtractiveProvider().digest("How much annual leave do senior staff get?", hits)
     assert "- **Grades**: Senior staff, 30 days of annual leave. Part-time staff receive annual leave pro rata [1]." in digest
     assert "|" not in digest and "##" not in digest
+
+
+# ---------------------------------------------------------------------------------------------------
+# Decline calibration (M2, M4)
+# ---------------------------------------------------------------------------------------------------
+
+# Best cosine (BAAI/bge-small-en-v1.5) and best cross-encoder score (ms-marco-MiniLM-L-6-v2) measured on
+# the sample corpus with the default retriever. The bands in ragkb.retrieval.base were chosen from these.
+MEASURED = {
+    # golden positives
+    "q01": (0.897, 9.66), "q02": (0.752, 6.02), "q03": (0.707, 3.71), "q04": (0.784, 6.19),
+    "q05": (0.737, 5.19), "q06": (0.823, 9.30), "q07": (0.754, 9.75), "q08": (0.800, 5.60),
+    "q09": (0.721, -0.75), "q10": (0.879, 9.73), "q11": (0.645, 1.63), "q12": (0.703, 5.05),
+    "q13": (0.610, 0.81),
+    # the report's phrasings: "How much money do I get for working from home?", "Tell me about remote work pay"
+    "m2a": (0.664, -3.28), "m2b": (0.759, 2.23),
+    # golden negatives
+    "n01": (0.512, -10.89), "n02": (0.468, -10.37), "n03": (0.652, -1.05), "n04": (0.583, -10.94),
+}
+POSITIVES = [key for key in MEASURED if not key.startswith("n")]
+NEGATIVES = [key for key in MEASURED if key.startswith("n")]
+
+
+def measured_level(key: str, *, with_reranker: bool) -> str | None:
+    cosine, rerank = MEASURED[key]
+    hit = Hit(chunk=make_hit(1, "x").chunk, score=0.03, vector_score=cosine,
+              rerank_score=rerank if with_reranker else None)
+    return classify(hit, rerank=rerank_band(DEFAULT_RERANK_MODEL) if with_reranker else None,
+                    cosine=cosine_band("BAAI/bge-small-en-v1.5"))
+
+
+@pytest.mark.parametrize("with_reranker", [True, False])
+def test_calibrated_bands_on_the_golden_measurements(with_reranker: bool):
+    for key in POSITIVES:
+        assert measured_level(key, with_reranker=with_reranker) != "weak", key
+    for key in NEGATIVES:
+        assert measured_level(key, with_reranker=with_reranker) != "strong", key
+    # The report's phrasings are strong matches, so a missing word ("money", "pay") cannot decline them.
+    assert measured_level("m2a", with_reranker=with_reranker) == "strong"
+    assert measured_level("m2b", with_reranker=with_reranker) == "strong"
+    # The plainly out-of-scope questions are weak; the near miss is left to the lexical check.
+    for key in ("n01", "n02", "n04"):
+        assert measured_level(key, with_reranker=with_reranker) == "weak", key
+    assert measured_level("n03", with_reranker=with_reranker) == "borderline"
+
+
+def ranked(n: int, text: str, *, relevance: str | None = None, vector: float | None = None,
+           rerank: float | None = None, doc: str | None = None, title: str = "Employee Handbook",
+           section: str = "", score: float = 0.03, ordinal: int | None = None,
+           neighbour_of: str | None = None) -> RankedHit:
+    base = make_hit(n, text, doc=doc, title=title, section=section, score=score)
+    chunk = base.chunk if ordinal is None else base.chunk.model_copy(
+        update={"ordinal": ordinal, "id": f"{base.chunk.doc_id}#{ordinal}"})
+    return RankedHit(chunk=chunk, score=score, vector_score=vector, rerank_score=rerank,
+                     relevance=relevance, neighbour_of=neighbour_of)
+
+
+REMOTE_WORK = (
+    "Most office roles may work remotely for up to 3 days per week under a signed Remote Work Agreement. "
+    "Working from another country is allowed for up to 20 working days per calendar year.\n\n"
+    "The company provides a one-time home office allowance of EUR 300 for a chair, desk or monitor when "
+    "your Remote Work Agreement is first approved."
+)
+
+
+@pytest.mark.parametrize(
+    "question", ["How much money do I get for working from home?", "Tell me about remote work pay"]
+)
+def test_extractive_answers_a_strong_match_with_a_missing_question_word(question: str):
+    hits = [
+        ranked(1, REMOTE_WORK, relevance="strong", vector=0.664, doc="handbook", section="Remote work"),
+        ranked(2, "Expense claims are paid with the next salary.", relevance="borderline", vector=0.61,
+               doc="travel", title="Travel and Expense Policy"),
+    ]
+    answer = run(question, hits, ExtractiveProvider())
+    assert answer.status == AnswerStatus.answered
+    assert "EUR 300" in answer.answer and answer.closest == []
+
+
+def test_extractive_uses_the_lexical_check_only_to_break_ties():
+    question = "How much money do I get for working from home?"
+    borderline = [ranked(1, REMOTE_WORK, relevance="borderline", vector=0.63, doc="handbook")]
+    # In the tie band the lexical rules decide, and "money" appears in no passage of a three-word topic.
+    assert run(question, borderline, ExtractiveProvider()).status == AnswerStatus.no_answer
+    about = "How many days per week can I work remotely?"
+    assert run(about, borderline, ExtractiveProvider()).status == AnswerStatus.answered
+
+
+def test_extractive_declines_when_every_passage_is_weak_even_with_matching_words():
+    hits = [ranked(1, REMOTE_WORK, relevance="weak", vector=0.52, doc="handbook"),
+            ranked(2, REMOTE_WORK.replace("300", "350"), relevance="weak", vector=0.50, doc="other")]
+    answer = run("How many days per week can I work remotely?", hits, ExtractiveProvider())
+    assert answer.status == AnswerStatus.no_answer and answer.answer is None
+    assert answer.message == "The knowledge base does not cover this question."
+
+
+def test_extractive_digest_leaves_out_weak_passages_when_a_better_one_exists():
+    hits = [
+        ranked(1, REMOTE_WORK, relevance="strong", vector=0.76, doc="handbook"),
+        ranked(2, "Remote diagnostics can be run from the dashboard by the support agent.", relevance="weak",
+               vector=0.51, doc="rma", title="Customer Return Procedure"),
+    ]
+    answer = run("How many days per week can I work remotely?", hits, ExtractiveProvider())
+    assert answer.status == AnswerStatus.answered
+    assert "Customer Return Procedure" not in answer.answer
+
+
+def test_extractive_digest_keeps_to_the_identifier_the_question_names():
+    rows = ("| SKU | Product | Price |\n|---|---|---|\n| FH-MNT-01 | Wall and pole mount | 29 |\n"
+            "| FH-CAL-01 | Calibration service | 79 |")
+    hits = [
+        ranked(1, rows, relevance="strong", doc="prices", title="Price List 2026"),
+        ranked(2, "Calibration can be ordered as a service (SKU FH-CAL-01), returned within 10 days.",
+               relevance="borderline", doc="faq", title="Product FAQ"),
+    ]
+    answer = run("What does FH-MNT-01 cost?", hits, ExtractiveProvider())
+    assert answer.status == AnswerStatus.answered
+    assert "FH-MNT-01, Wall and pole mount, 29" in answer.answer
+    assert "FH-CAL-01" not in answer.answer and "Product FAQ" not in answer.answer
+
+
+def test_model_is_not_called_when_every_reranked_passage_is_weak():
+    provider = FakeProvider("should not be used")
+    hits = [ranked(1, REMOTE_WORK, relevance="weak", vector=0.51, rerank=-10.9),
+            ranked(2, "Other text about offices.", relevance="weak", vector=0.50, rerank=-11.0)]
+    assert weak_by_reranker(hits)
+    answer = run("Can I bring my dog to work?", hits, provider)
+    assert provider.calls == []
+    assert answer.status == AnswerStatus.no_answer and answer.answer is None
+    assert answer.message == "The knowledge base does not cover this question."
+    assert answer.provider.name == "claude_code" and answer.provider.model is None
+    assert [c.marker for c in answer.closest] == [1, 2]
+
+
+def test_plain_hits_with_weak_rerank_scores_are_declined_before_the_call_too():
+    provider = FakeProvider("should not be used")
+    hits = [make_hit(1, "Text.", score=0.03).model_copy(update={"rerank_score": -9.5})]
+    assert run("Anything?", hits, provider).status == AnswerStatus.no_answer
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize(
+    "hits",
+    [
+        # a borderline rerank score: the model decides
+        [ranked(1, REMOTE_WORK, relevance="borderline", vector=0.65, rerank=-1.0)],
+        # weak cosine but no reranker: the model decides (only a reranker may skip the call)
+        [ranked(1, REMOTE_WORK, relevance="weak", vector=0.50)],
+        # no calibrated score at all
+        [make_hit(1, REMOTE_WORK)],
+    ],
+)
+def test_model_is_called_unless_the_reranker_calls_everything_weak(hits):
+    provider = FakeProvider("Up to 3 days a week [1].")
+    answer = run("How many days per week can I work remotely?", hits, provider)
+    assert len(provider.calls) == 1 and answer.status == AnswerStatus.answered
+
+
+# ---------------------------------------------------------------------------------------------------
+# Closest passages (I4) and citation scores (M4)
+# ---------------------------------------------------------------------------------------------------
+
+SCORED_HITS = [
+    ranked(i, f"Passage {i} about the office.", vector=0.6 - i / 100, rerank=-2.0 - i, score=0.03 - i / 1000,
+           doc=f"d{i}", title=f"Doc {i}")
+    for i in range(1, 6)
+]
+
+
+def test_closest_passages_come_with_every_no_answer():
+    extractive = run("Is there a dress code for staff?", SCORED_HITS, ExtractiveProvider())
+    declined = run("Is there a dress code for staff?", SCORED_HITS, FakeProvider("NO_ANSWER"))
+    for answer in (extractive, declined):
+        assert answer.status == AnswerStatus.no_answer
+        assert answer.message == "The knowledge base does not cover this question."
+        assert answer.answer is None and answer.citations == []
+        assert [c.marker for c in answer.closest] == [1, 2, 3]
+        assert [c.chunk_id for c in answer.closest] == [h.chunk.id for h in SCORED_HITS[:3]]
+        first = answer.closest[0]
+        assert first.snippet == "Passage 1 about the office."
+        assert first.score == pytest.approx(0.029)
+        assert first.vector_score == pytest.approx(0.59) and first.rerank_score == pytest.approx(-3.0)
+
+
+def test_closest_is_empty_unless_the_status_is_no_answer():
+    answered = run("How many days per week can I work remotely?",
+                   [ranked(1, REMOTE_WORK, relevance="strong")], FakeProvider("Three days [1]."))
+    assert answered.status == AnswerStatus.answered and answered.closest == []
+    no_docs = run("Anything?", SCORED_HITS, FakeProvider("NO_ANSWER"), has_documents=False)
+    assert no_docs.status == AnswerStatus.no_documents and no_docs.closest == []
+    failed = run("Anything?", SCORED_HITS, FakeProvider(error=ProviderError("timeout", "slow")))
+    assert failed.closest == []
+    assert run("Anything?", [], FakeProvider("x")).closest == []
+
+
+def test_closest_skips_passages_attached_as_context():
+    anchor = ranked(1, "Lead times by product.", relevance="borderline", doc="lead", ordinal=4)
+    context = ranked(2, "| Monitor | 5 |", doc="lead", ordinal=5, score=0.0, neighbour_of="lead#4")
+    answer = run("Unrelated?", [anchor, context], FakeProvider("NO_ANSWER"))
+    assert [c.chunk_id for c in answer.closest] == ["lead#4"]
+
+
+def test_citations_carry_fused_cosine_and_rerank_scores_and_the_page_range():
+    hit = ranked(1, "Full-time employees receive 27 days of paid annual leave.", vector=0.897, rerank=9.66,
+                 score=0.0325, relevance="strong")
+    hit = hit.model_copy(update={"chunk": hit.chunk.model_copy(update={"page": 3, "page_start": 3, "page_end": 4})})
+    answer = run("How many days of annual leave?", [hit], FakeProvider("27 days [1]."))
+    citation = answer.citations[0]
+    assert citation.score == pytest.approx(0.0325)
+    assert citation.vector_score == pytest.approx(0.897) and citation.rerank_score == pytest.approx(9.66)
+    assert (citation.page, citation.page_end) == (3, 4)
+    single = run("How many days?", [make_hit(1, "27 days.", page=2)], FakeProvider("27 [1]."))
+    assert single.citations[0].page_end is None and single.citations[0].vector_score is None
+
+
+# ---------------------------------------------------------------------------------------------------
+# Neighbour ordering (I3)
+# ---------------------------------------------------------------------------------------------------
+
+def test_neighbours_follow_their_anchor_and_say_so_in_the_header():
+    anchor = ranked(1, "| LTE modem kit | 10 |", doc="lead", ordinal=4, title="Price list", relevance="strong")
+    second = ranked(2, "Orders ship the next working day.", doc="ship", title="Shipping")
+    before = ranked(3, "| Product | Days |", doc="lead", ordinal=3, title="Price list", score=0.0,
+                    neighbour_of="lead#4")
+    after = ranked(4, "| Solar panel kit | 10 |", doc="lead", ordinal=5, title="Price list", score=0.0,
+                   neighbour_of="lead#4")
+    prompt, kept = build_prompt("Lead time of the LTE kit?", [anchor, after, second, before], 12000)
+    assert [h.chunk.id for h in kept] == ["lead#4", "lead#3", "lead#5", "ship#2"]
+    assert "[2] (Price list, the text just before [1])" in prompt
+    assert "[3] (Price list, the text just after [1])" in prompt
+    assert prompt.index("[3] (") < prompt.index("[4] (Shipping")
+
+
+def test_neighbours_get_the_budget_only_after_every_ranked_passage():
+    anchor = ranked(1, "a" * 400, doc="lead", ordinal=4)
+    second = ranked(2, "b" * 400, doc="ship")
+    context = ranked(3, "c" * 400, doc="lead", ordinal=5, score=0.0, neighbour_of="lead#4")
+    _, kept = build_prompt("q", [anchor, context, second], 900)
+    assert [h.chunk.id for h in kept] == ["lead#4", "ship#2"], "the ranked passage wins the budget"
+    _, kept = build_prompt("q", [anchor, context, second], 2000)
+    assert [h.chunk.id for h in kept] == ["lead#4", "lead#5", "ship#2"]
+    orphan = ranked(4, "d" * 10, doc="gone", ordinal=1, score=0.0, neighbour_of="gone#0")
+    _, kept = build_prompt("q", [anchor, orphan], 2000)
+    assert [h.chunk.id for h in kept] == ["lead#4"], "a neighbour whose anchor was not kept is dropped"
+
+
+def test_a_neighbour_can_be_cited_and_is_renumbered():
+    anchor = ranked(1, "| LTE modem kit | 10 |", doc="lead", ordinal=4, relevance="strong")
+    after = ranked(2, "| Solar panel kit | 10 |", doc="lead", ordinal=5, score=0.0, neighbour_of="lead#4")
+    answer = run("Lead times?", [anchor, after], FakeProvider("The solar kit takes 10 days [2]."))
+    assert answer.answer == "The solar kit takes 10 days [1]."
+    assert answer.citations[0].chunk_id == "lead#5" and answer.citations[0].score == 0.0
+    assert answer.passages_considered == 2
+
+
+# ---------------------------------------------------------------------------------------------------
+# A model the provider does not know (L4a)
+# ---------------------------------------------------------------------------------------------------
+
+def test_unknown_model_shows_the_providers_own_sentence():
+    message = "Codex cannot use the model gpt-nope. Choose one of: gpt-6-sol, gpt-6-luna."
+    answer = run("How much leave?", LEAVE_HITS, FakeProvider(error=ModelNotAvailableError(message)))
+    assert answer.status == AnswerStatus.provider_unavailable and answer.message == message
+    status, text = error_message(ModelNotAvailableError(message), "Codex")
+    assert (status, text) == (AnswerStatus.provider_unavailable, message)
+    refused = compose_provider_error("How much leave?", ModelNotAvailableError(message), provider_name="codex",
+                                     collection_id="col", knowledge_version="v1", model="gpt-nope")
+    assert refused.message == message and "try again" not in refused.message.lower()

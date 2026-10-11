@@ -82,17 +82,44 @@ def densify(text: str, kept: list[Hit]) -> tuple[str, list[Citation]]:
 
 
 def _citation(marker: int, hit: Hit) -> Citation:
+    """The citation for *hit*: where it is, its first characters, and its three scores. ``score`` is
+    the fused rank score (0 for a passage attached as context), ``vector_score`` the raw cosine and
+    ``rerank_score`` the cross-encoder's score when a reranker ran."""
     chunk = hit.chunk
+    page = chunk.page if chunk.page is not None else chunk.page_start
+    page_end = chunk.page_end if chunk.page_end is not None and chunk.page_end != page else None
     return Citation(
         marker=marker,
         chunk_id=chunk.id,
         doc_id=chunk.doc_id,
         title=chunk.title,
-        page=chunk.page,
+        page=page,
+        page_end=page_end,
         section=chunk.section,
         snippet=snippet(chunk.text),
         score=hit.score,
+        vector_score=hit.vector_score,
+        rerank_score=hit.rerank_score,
     )
+
+
+CLOSEST_LIMIT = 3
+
+
+def closest(hits: list[Hit], limit: int = CLOSEST_LIMIT) -> list[Citation]:
+    """Citations for the best-ranked passages (markers 1..n, at most *limit*), shown with a decline so
+    the person can judge for themselves. Passages attached as context are not candidates."""
+    ranked = [hit for hit in hits if getattr(hit, "neighbour_of", None) is None]
+    out: list[Citation] = []
+    seen: set[str] = set()
+    for hit in ranked:
+        if hit.chunk.id in seen:
+            continue
+        seen.add(hit.chunk.id)
+        out.append(_citation(len(out) + 1, hit))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def snippet(text: str, limit: int = SNIPPET_CHARS) -> str:

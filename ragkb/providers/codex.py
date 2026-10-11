@@ -46,6 +46,35 @@ CODEX_EXTENSION = ExtensionSpec(
 REASONING_RE = re.compile(r"^[a-z]{2,10}$")
 _TOKENS_RE = re.compile(r"tokens used\s*:?\s*\n?\s*([\d,]+)", re.IGNORECASE)
 _MODEL_LINE_RE = re.compile(r"^model:\s*(\S+)\s*$", re.MULTILINE)
+# How the vendor says it does not know a model: "The 'x' model is not supported when using Codex with a
+# ChatGPT account", "The model `x` does not exist or you do not have access to it", model_not_found.
+_UNKNOWN_MODEL_RE = re.compile(
+    r"\bmodel\b[^\n]{0,80}?\b(?:is not supported|not supported|does not exist|not found|is unknown|is invalid)"
+    r"|\b(?:unsupported|unknown|invalid)[ _]model\b|\bmodel_not_found\b",
+    re.IGNORECASE,
+)
+
+
+class ModelNotAvailableError(ProviderError):
+    """The provider does not know the model it was asked for. Trying again cannot help, so the message
+    (which names the model and the known ones) is shown as it is."""
+
+    show_message = True
+
+    def __init__(self, message: str):
+        super().__init__("failed", message)
+
+
+def model_not_available_message(display_name: str, model: str, known: list[str]) -> str:
+    """One plain sentence naming the refused model, then the models to choose from."""
+    if known:
+        return f"{display_name} cannot use the model {model}. Choose one of: {', '.join(known)}."
+    return f"{display_name} cannot use the model {model}. Leave the model empty to use the {display_name} default."
+
+
+def is_unknown_model_error(text: str) -> bool:
+    """True when CLI error output says the model is not known or not available to this account."""
+    return bool(_UNKNOWN_MODEL_RE.search(text or ""))
 
 
 def _codex_known_dirs() -> list[Path]:
@@ -99,6 +128,21 @@ def known_models(home: Path | None = None) -> list[str]:
             if entry["slug"] not in models:
                 models.append(entry["slug"])
     return models
+
+
+def accepted_models(home: Path | None = None) -> set[str]:
+    """Every model this Codex install has confirmed, including the ones its cache hides from the picker.
+    Empty when neither the config nor the cache exists, which means nothing can be judged."""
+    home = home or codex_home()
+    accepted = set(known_models(home))
+    try:
+        cache = json.loads((home / "models_cache.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    entries = cache.get("models") if isinstance(cache, dict) else None
+    if isinstance(entries, list):
+        accepted |= {e["slug"] for e in entries if isinstance(e, dict) and isinstance(e.get("slug"), str)}
+    return accepted
 
 
 def parse_tokens_used(text: str) -> int | None:
@@ -219,6 +263,10 @@ class CodexProvider:
     def parse_run(self, run: CliRun, answer: str | None, prompt: str, requested_model: str | None) -> ProviderResult:
         diagnostics = diagnostic_text(f"{run.stdout}\n{run.stderr}", prompt)
         if run.returncode != 0 or answer is None:
+            if is_unknown_model_error(diagnostics):
+                model = requested_model or configured_model() or "configured for it"
+                logger.warning("codex call failed: the model is not available")
+                raise ModelNotAvailableError(model_not_available_message(self.display_name, model, known_models()))
             raise self._error(classify_error(diagnostics), vendor_message(diagnostics) or "no answer")
         model_match = _MODEL_LINE_RE.search(diagnostics)
         model = model_match.group(1) if model_match else (requested_model or configured_model())

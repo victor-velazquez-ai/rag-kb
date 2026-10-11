@@ -60,6 +60,11 @@ cases:
     expect_sources: ["price-list-2026.xlsx"]
     expect_keywords: ["89"]
     note: "the product FAQ names the kit too; the price is only in the spreadsheet"
+  - id: q14
+    question: "What does FH-MNT-01 cost?"
+    expect_sources: ["price-list-2026.xlsx"]
+    expect_keywords: ["29"]
+    note: "an exact product code that only one spreadsheet row holds; the FAQ names other FH codes"
   - id: n01
     question: "What was the company's revenue last year?"
     expect: empty
