@@ -5,7 +5,9 @@ Everything skips cleanly while the parts it needs are not installed.
 """
 from __future__ import annotations
 
+import inspect
 import json
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -21,10 +23,15 @@ from mcp import Client
 from mcp.client.streamable_http import streamable_http_client
 
 from ragkb.config import Settings
-from ragkb.models import Collection, Document, Hit
+from ragkb.models import Answer, AnswerStatus, Chunk, Citation, Collection, Document, DocumentStatus, Hit
+from tests.test_api import PART_A, PART_A_REASON, MemoryMeta, add_doc
 
 server = pytest.importorskip("ragkb.mcp.server")
 service = pytest.importorskip("ragkb.retrieval.service")
+
+# The retrieval and answer part that fills `closest` also takes the composer's budget in search.
+PART_B = "budget_chars" in inspect.signature(service.Retriever.search).parameters
+PART_B_REASON = "needs the retrieval and answer part that fills the closest passages"
 
 LOCAL_BASE = "http://127.0.0.1:8765"
 TOOL_NAMES = {"list_collections", "list_documents", "search_knowledge_base", "ask_knowledge_base"}
@@ -115,9 +122,12 @@ NOW = datetime.now(UTC)
 
 
 class FakeMeta:
-    def __init__(self, *, broken: bool = False) -> None:
+    """A store without ``count_documents``: counts come from the document rows."""
+
+    def __init__(self, *, broken: bool = False, documents: list[Document] | None = None) -> None:
         self.broken = broken
         self.collection = Collection(id="c1", name="Fake", created_at=NOW)
+        self.documents = documents or []
         self.audits: list[tuple[str, dict[str, Any]]] = []
         self.answers: list[str] = []
 
@@ -130,7 +140,7 @@ class FakeMeta:
         return [self.collection]
 
     def list_documents(self, collection_id: str) -> list[Document]:
-        return []
+        return [d for d in self.documents if d.collection_id == collection_id]
 
     def current_version(self) -> str:
         return "v20260101.1"
@@ -152,10 +162,10 @@ class FakeStore:
         return True
 
 
-def fake_deps(*, public: bool = False, broken: bool = False, retriever: Any = None) -> SimpleNamespace:
+def fake_deps(*, public: bool = False, broken: bool = False, retriever: Any = None, meta: Any = None) -> SimpleNamespace:
     return SimpleNamespace(
-        settings=Settings(_env_file=None, MCP_PUBLIC=public, DATA_DIR=Path("unused")),
-        meta=FakeMeta(broken=broken),
+        settings=Settings(_env_file=None, MCP_PUBLIC=public, DATA_DIR=Path("unused"), RERANKER="none"),
+        meta=meta or FakeMeta(broken=broken),
         store=FakeStore(),
         embedder=None,
         retriever=retriever or DownRetriever(),
@@ -164,17 +174,37 @@ def fake_deps(*, public: bool = False, broken: bool = False, retriever: Any = No
     )
 
 
+def make_hit(text: str, title: str = "Office rules", score: float = 0.4) -> Hit:
+    chunk = Chunk(id=f"{uuid.uuid4().hex}#0", doc_id="d1", collection_id="c1", ordinal=0, text=text,
+                  embed_text=f"{title}: {text}", title=title, section="Pets", page=2, created_at=NOW)
+    return Hit(chunk=chunk, score=score)
+
+
+class HitRetriever:
+    """Returns fixed hits and records the context budget it was asked for."""
+
+    def __init__(self, hits: list[Hit]) -> None:
+        self.hits = hits
+        self.budgets: list[int | None] = []
+
+    def search(self, collection_id: str, query: str, top_k: int, *, budget_chars: int | None = None) -> list[Hit]:
+        self.budgets.append(budget_chars)
+        return self.hits[:top_k]
+
+
 # ---------------------------------------------------------------- a real index
 
 
 @pytest.fixture
 def kb(tmp_path: Path) -> SimpleNamespace:
+    if not PART_A:
+        pytest.skip(PART_A_REASON)
     sqlite_meta = pytest.importorskip("ragkb.store.sqlite_meta")
     lancedb_store = pytest.importorskip("ragkb.store.lancedb_store")
     embedder_mod = pytest.importorskip("ragkb.retrieval.embedder")
     pipeline_mod = pytest.importorskip("ragkb.ingest.pipeline")
 
-    settings = Settings(_env_file=None, DATA_DIR=tmp_path / "data")
+    settings = Settings(_env_file=None, DATA_DIR=tmp_path / "data", RERANKER="none")
     settings.ensure_dirs()
     meta = sqlite_meta.SQLiteMeta(settings.meta_path)
     embedder = embedder_mod.FakeEmbedder(dims=384)
@@ -238,10 +268,30 @@ def test_legacy_handshake_clients_work_too() -> None:
 def test_list_collections(kb: SimpleNamespace) -> None:
     payload = payload_of(call(kb.app, "list_collections"))
     by_name = {c["name"]: c for c in payload["collections"]}
-    assert by_name["Sample"]["documents"] == 3
+    assert by_name["Sample"]["documents"] == 3 and by_name["Sample"]["documents_total"] == 3
     assert by_name["Sample"]["id"] == kb.collection.id
     assert by_name["Empty"]["documents"] == 0
     assert payload["knowledge_version"].startswith("v")
+
+
+def test_list_collections_counts_ready_first_with_and_without_a_counting_store() -> None:
+    def doc(name: str, status: DocumentStatus) -> Document:
+        return Document(id=uuid.uuid4().hex, collection_id="c1", title=name, filename=name, media_type="text/plain",
+                        size_bytes=1, content_hash=name, status=status, uploaded_at=NOW)
+
+    rows = [doc("a", DocumentStatus.ready), doc("b", DocumentStatus.ready), doc("c", DocumentStatus.failed),
+            doc("d", DocumentStatus.processing)]
+    payload, is_error = server.KnowledgeBaseTools(fake_deps(meta=FakeMeta(documents=rows))).call("list_collections", {})
+    assert is_error is False
+    assert payload["collections"][0]["documents"] == 2 and payload["collections"][0]["documents_total"] == 4
+
+    meta = MemoryMeta()
+    collection = meta.create_collection("Counted")
+    for name, status in (("a.md", DocumentStatus.ready), ("b.md", DocumentStatus.failed),
+                         ("c.md", DocumentStatus.queued)):
+        add_doc(meta, collection.id, name, status)
+    payload, _ = server.KnowledgeBaseTools(fake_deps(meta=meta)).call("list_collections", {})
+    assert (payload["collections"][0]["documents"], payload["collections"][0]["documents_total"]) == (1, 3)
 
 
 def test_list_documents_by_id_and_by_name(kb: SimpleNamespace) -> None:
@@ -285,6 +335,56 @@ def test_ask_returns_a_brief_with_guidance(kb: SimpleNamespace) -> None:
     assert markers == list(range(1, len(markers) + 1)) and markers
     assert [p["marker"] for p in brief["passages"]] == markers
     assert any("27 days" in p["text"] for p in brief["passages"])
+
+
+def test_ask_brings_the_closest_passages_when_not_covered(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = "Dogs are not allowed in the office, except assistance dogs registered with the facilities team."
+    hits = [make_hit(full), make_hit("Plants on desks are welcome.", title="Facilities", score=0.2)]
+
+    def not_covered(question: str, found: list[Hit], provider: Any, settings: Any, **kwargs: Any) -> Answer:
+        closest = [Citation(marker=n, chunk_id=h.chunk.id, doc_id=h.chunk.doc_id, title=h.chunk.title,
+                            page=h.chunk.page, section=h.chunk.section, snippet=h.chunk.text[:20], score=h.score)
+                   for n, h in enumerate(found, start=1)]
+        return Answer(id=uuid.uuid4().hex, question=question, collection_id=kwargs["collection_id"],
+                      status=AnswerStatus.no_answer, message="The knowledge base does not cover this question.",
+                      closest=closest, created_at=NOW)
+
+    monkeypatch.setattr(server, "compose", not_covered)
+    tools = server.KnowledgeBaseTools(fake_deps(retriever=HitRetriever(hits)))
+    brief, is_error = tools.call("ask_knowledge_base", {"collection_id": "c1", "question": "Can I bring my cat?"})
+    assert is_error is False
+    assert brief["status"] == "no_answer" and brief["answer"] is None and brief["citations"] == []
+    assert [c["title"] for c in brief["closest"]] == ["Office rules", "Facilities"]
+    assert brief["closest"][0]["text"] == full and brief["closest"][0]["snippet"] == full[:20]
+    assert "closest" in brief["guidance"]
+
+    def answered(question: str, found: list[Hit], provider: Any, settings: Any, **kwargs: Any) -> Answer:
+        return Answer(id=uuid.uuid4().hex, question=question, collection_id=kwargs["collection_id"],
+                      status=AnswerStatus.answered, answer="No [1].", created_at=NOW)
+
+    monkeypatch.setattr(server, "compose", answered)
+    brief, _ = tools.call("ask_knowledge_base", {"collection_id": "c1", "question": "Dogs?"})
+    assert brief["closest"] == []
+
+
+def test_ask_retrieves_with_the_composer_budget_and_search_does_not() -> None:
+    retriever = HitRetriever([make_hit("Core hours are 10 to 16.")])
+    deps = fake_deps(retriever=retriever)
+    tools = server.KnowledgeBaseTools(deps)
+    payload, is_error = tools.call("search_knowledge_base", {"collection_id": "c1", "query": "hours"})
+    assert is_error is False and payload["status"] == "ok"
+    tools.call("ask_knowledge_base", {"collection_id": "c1", "question": "What are the core hours?"})
+    assert retriever.budgets == [None, deps.settings.MAX_CONTEXT_CHARS]
+
+
+@pytest.mark.skipif(not PART_B, reason=PART_B_REASON)
+def test_ask_on_the_real_index_returns_closest_for_an_uncovered_question(kb: SimpleNamespace) -> None:
+    brief = payload_of(call(kb.app, "ask_knowledge_base",
+                            {"collection_id": kb.collection.id, "question": "Which dog breeds may visit the office?"}))
+    if brief["status"] != "no_answer":
+        pytest.skip("the extractive digest found an answer for this question")
+    assert brief["answer"] is None and brief["closest"]
+    assert all(c["text"] and c["title"] for c in brief["closest"])
 
 
 def test_ask_on_an_empty_collection_is_not_an_answer(kb: SimpleNamespace) -> None:
@@ -425,7 +525,7 @@ def test_requests_before_startup_get_a_plain_error() -> None:
 
 def test_disabled_mcp_mounts_nothing() -> None:
     deps = fake_deps()
-    deps.settings = Settings(_env_file=None, MCP_ENABLED=False, DATA_DIR=Path("unused"))
+    deps.settings = Settings(_env_file=None, MCP_ENABLED=False, DATA_DIR=Path("unused"), RERANKER="none")
     app = make_app(deps)
     assert not any(getattr(route, "path", None) == "/mcp" for route in app.router.routes)
 
@@ -442,7 +542,7 @@ def test_route_wins_over_a_catch_all_mount() -> None:
 def test_mounted_on_the_full_app(tmp_path: Path) -> None:
     app_mod = pytest.importorskip("ragkb.server.app")
     deps_mod = pytest.importorskip("ragkb.server.deps")
-    settings = Settings(_env_file=None, DATA_DIR=tmp_path / "data")
+    settings = Settings(_env_file=None, DATA_DIR=tmp_path / "data", RERANKER="none")
     deps = deps_mod.build_deps(settings, fake_embedder=True)
     if deps.meta is None:
         pytest.skip("the metadata store part is not installed yet")

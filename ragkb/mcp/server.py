@@ -37,6 +37,8 @@ from ragkb.answer.compose import compose, compose_unavailable
 from ragkb.models import Collection, Hit
 from ragkb.providers.extractive import ExtractiveProvider
 from ragkb.retrieval.service import RetrievalUnavailable
+from ragkb.server.counts import document_counts, headline
+from ragkb.server.deps import compose_search_options
 from ragkb.server.loopback import host_is_loopback, origin_is_loopback
 
 if TYPE_CHECKING:
@@ -57,7 +59,9 @@ GUIDANCE = (
     "markers exactly as they appear in `citations` and `passages`, right after the sentence each one "
     "supports, and never cite a number that is not listed there. If the status is not `answered`, or "
     "the brief does not cover the question, say plainly that the knowledge base does not cover it "
-    "instead of guessing or filling the gap from general knowledge."
+    "instead of guessing or filling the gap from general knowledge. When the status is `no_answer`, "
+    "`closest` lists the nearest passages: you may point the user to them as related material, but "
+    "never present them as the answer."
 )
 
 INSTRUCTIONS = (
@@ -89,8 +93,9 @@ TOOLS: list[types.Tool] = [
         name="list_collections",
         title="List collections",
         description=(
-            "List the knowledge base collections with their id, name, description and number of "
-            "searchable documents. Call this first to get a collection id."
+            "List the knowledge base collections with their id, name and description. `documents` is "
+            "the number of searchable (ready) documents; `documents_total` also counts failed and "
+            "in-progress ones. Call this first to get a collection id."
         ),
         input_schema={"type": "object", "properties": {}, "additionalProperties": False},
         annotations=_READ_ONLY,
@@ -140,7 +145,8 @@ TOOLS: list[types.Tool] = [
         description=(
             "Answer a question from one collection's documents. Returns a brief: a status (answered, "
             "no_answer, no_documents, retrieval_unavailable), an extractive digest with [n] markers, "
-            "numbered citations, the cited passages in full, and guidance. Write the final answer from "
+            "numbered citations, the cited passages in full, and guidance. When the status is "
+            "no_answer, `closest` holds the nearest passages for reference. Write the final answer from "
             "the brief, citing with the same [n] markers; when the status is not answered, tell the "
             "user the documents do not cover the question."
         ),
@@ -323,6 +329,11 @@ class KnowledgeBaseTools:
             logger.warning("could not check whether the collection has documents", exc_info=True)
             return False
 
+    def _compose_options(self, retriever: Any) -> dict[str, Any]:
+        """The same retrieval the app's answers use: every passage that fits the composer's budget."""
+        settings = getattr(self._deps, "settings", None)
+        return compose_search_options(retriever, settings) if settings is not None else {}
+
     def _audit(self, event: str, **fields: Any) -> None:
         try:
             self._meta.audit(event, **fields)
@@ -332,17 +343,18 @@ class KnowledgeBaseTools:
     # ---- tools
 
     def list_collections(self) -> dict[str, Any]:
+        """`documents` is the ready (searchable) count, the same number the web app shows."""
         meta = self._meta
         rows = []
         for collection in meta.list_collections():
-            documents = meta.list_documents(collection.id)
-            ready = sum(1 for d in documents if _status_value(d.status) == "ready")
+            counts = headline(document_counts(meta, collection.id))
             rows.append(
                 {
                     "id": collection.id,
                     "name": collection.name,
                     "description": collection.description,
-                    "documents": ready,
+                    "documents": counts["documents"],
+                    "documents_total": counts["documents_total"],
                 }
             )
         return {"collections": rows, "knowledge_version": self._version()}
@@ -416,7 +428,7 @@ class KnowledgeBaseTools:
         try:
             if retriever is None:
                 raise RetrievalUnavailable("no retriever")
-            hits = list(retriever.search(collection.id, question, top_k))
+            hits = list(retriever.search(collection.id, question, top_k, **self._compose_options(retriever)))
         except Exception as exc:
             if not isinstance(exc, RetrievalUnavailable):
                 logger.exception("mcp ask: search failed")
@@ -446,6 +458,16 @@ class KnowledgeBaseTools:
                     "text": hit.chunk.text if hit is not None else citation.snippet,
                 }
             )
+        closest = []
+        if _status_value(answer.status) == "no_answer":
+            for citation in answer.closest:
+                hit = by_chunk.get(citation.chunk_id)
+                closest.append(
+                    {
+                        **citation.model_dump(mode="json"),
+                        "text": hit.chunk.text if hit is not None else citation.snippet,
+                    }
+                )
 
         try:
             self._meta.save_answer(answer.model_dump_json(), answer.id, collection.id)
@@ -466,6 +488,7 @@ class KnowledgeBaseTools:
 
         brief = answer.model_dump(mode="json")
         brief["passages"] = passages
+        brief["closest"] = closest
         brief["guidance"] = GUIDANCE
         return brief
 

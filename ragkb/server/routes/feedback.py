@@ -1,13 +1,13 @@
-"""POST /api/answers/{aid}/feedback: thumbs up or down with an optional note."""
+"""Feedback on answers: record a thumbs up or down with an optional note, and read the votes back."""
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from ragkb.models import Feedback
-from ragkb.server.deps import DepsDep, utcnow
+from ragkb.server.deps import DepsDep
 
 router = APIRouter(tags=["feedback"])
 
@@ -19,10 +19,17 @@ class FeedbackRequest(BaseModel):
 
 @router.post("/answers/{aid}/feedback", response_model=Feedback, status_code=201)
 def add_feedback(aid: str, body: FeedbackRequest, deps: DepsDep) -> Feedback:
-    meta = deps.require("meta")
-    answer = deps.get_answer(aid)
-    item = Feedback(answer_id=answer.id, rating=body.rating, note=body.note.strip(), created_at=utcnow())
-    meta.add_feedback(item)
-    deps.audit("feedback", collection_id=answer.collection_id, answer_id=answer.id, rating=body.rating,
-               has_note=bool(item.note))
-    return item
+    return deps.add_feedback(aid, body.rating, body.note)
+
+
+@router.get("/answers/{aid}/feedback", response_model=list[Feedback])
+def answer_feedback(aid: str, deps: DepsDep) -> list[Feedback]:
+    """The votes on one answer, newest first."""
+    return deps.answer_feedback(aid)
+
+
+@router.get("/collections/{cid}/feedback", response_model=list[Feedback])
+def collection_feedback(cid: str, deps: DepsDep,
+                        limit: Annotated[int, Query(ge=1, le=1000)] = 100) -> list[Feedback]:
+    """A collection's votes, newest first, each with the question it was about."""
+    return deps.list_feedback(cid, limit=limit)

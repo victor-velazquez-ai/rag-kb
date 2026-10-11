@@ -5,7 +5,6 @@ Exit codes: 0 ok, 1 failure, 2 usage. `eval` returns its gate's code: 0 PASS, 1 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -36,6 +35,7 @@ from ragkb.server.deps import (
 )
 from ragkb.server.errors import ApiError, plain_error
 from ragkb.server.loopback import host_is_loopback
+from ragkb.server.text import short_name
 
 try:
     from ragkb.evals.run import format_report, run_eval
@@ -45,6 +45,10 @@ except Exception:  # noqa: BLE001 - the evaluation part is optional
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE = 0, 1, 2
 DEFAULT_COLLECTION = "default"
+# One-time downloads from the Hugging Face hub into the fastembed cache, named so a first run that
+# waits on them does not look stuck.
+EMBED_DOWNLOAD_SIZE = "about 130 MB"
+RERANK_DOWNLOAD_SIZE = "about 90 MB"
 
 _STATE_LABELS: dict[str, str] = {
     AnswerStatus.no_answer.value: "Not covered",
@@ -127,7 +131,11 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 
 def _collect_files(paths: list[Path]) -> tuple[list[tuple[Path, str]], list[tuple[str, str]]]:
-    """Expand folders recursively. Returns (file, display name) pairs and skipped (name, reason) pairs."""
+    """Expand folders recursively. Returns (file, path) pairs and skipped (name, reason) pairs.
+
+    The path is the file's identity in the collection, as a folder upload in the web app sends it: the
+    folder's own name, then the path inside it (``handbook/hr/leave.md``); a single file is its name.
+    """
     found: list[tuple[Path, str]] = []
     skipped: list[tuple[str, str]] = []
     seen: set[Path] = set()
@@ -136,11 +144,12 @@ def _collect_files(paths: list[Path]) -> tuple[list[tuple[Path, str]], list[tupl
             items = [(root, root.name)]
         else:
             items = []
+            base = root.resolve().name
             for p in sorted(root.rglob("*")):
                 rel = p.relative_to(root)
                 if any(part.startswith(".") for part in rel.parts) or not p.is_file():
                     continue
-                items.append((p, str(rel).replace("\\", "/")))
+                items.append((p, "/".join(part for part in (base, *rel.parts) if part)))
         for path, display in items:
             resolved = path.resolve()
             if resolved in seen:
@@ -179,7 +188,8 @@ def _short(value: float) -> str:
 
 
 def format_answer(answer: Answer) -> str:
-    """The answer as plain text, then a numbered sources list."""
+    """The answer as plain text, then a numbered sources list. A question the documents do not cover
+    shows the closest passages under their own heading, so the reader can judge for themselves."""
     status = answer.status.value if isinstance(answer.status, AnswerStatus) else str(answer.status)
     lines: list[str] = []
     if status == AnswerStatus.answered.value and answer.answer:
@@ -195,6 +205,18 @@ def format_answer(answer: Answer) -> str:
                 where.append(c.section)
             suffix = f" ({', '.join(where)})" if where else ""
             lines.append(f"  [{c.marker}] {c.title}{suffix}  score {_short(c.score)}")
+    if status == AnswerStatus.no_answer.value and answer.closest:
+        lines.append("")
+        lines.append("Closest passages (they do not answer the question):")
+        for n, c in enumerate(answer.closest, start=1):
+            where = [f"p. {c.page}"] if c.page is not None else []
+            if c.section:
+                where.append(c.section)
+            suffix = f" ({', '.join(where)})" if where else ""
+            lines.append(f"  {n}. {c.title}{suffix}  score {_short(c.score)}")
+            snippet = " ".join(c.snippet.split())
+            if snippet:
+                lines.append(f"     {snippet[:200]}{'...' if len(snippet) > 200 else ''}")
     info = []
     if answer.provider:
         model = f" ({answer.provider.model})" if answer.provider.model else ""
@@ -280,7 +302,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             print(f"Created collection '{collection.name}'.")
         cap = settings.MAX_UPLOAD_MB * 1024 * 1024
         rows: list[list[str]] = []
-        counts = {"ready": 0, "already indexed": 0, "failed": 0, "skipped": len(skipped)}
+        counts = {"ready": 0, "replaced": 0, "duplicates": 0, "failed": 0, "skipped": len(skipped)}
         for path, display in files:
             print(f"  indexing {display} ...", end="\r", flush=True)
             data = path.read_bytes()
@@ -292,32 +314,43 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                 rows.append([display, "failed", "", "", "empty file"])
                 counts["failed"] += 1
                 continue
-            existing = deps.meta.find_by_hash(collection.id, hashlib.sha256(data).hexdigest())
-            if existing is not None and existing.status == DocumentStatus.ready:
-                rows.append([display, "already indexed", str(existing.chunk_count), str(existing.pages or ""), ""])
-                counts["already indexed"] += 1
-                continue
             try:
-                doc = deps.pipeline.ingest_bytes(collection.id, data, path.name)
-            except Exception as exc:  # noqa: BLE001 - each check reports its own failure
+                result = deps.pipeline.ingest_bytes(collection.id, data, path.name, source_path=display)
+            except Exception as exc:  # noqa: BLE001 - each file reports its own failure
                 rows.append([display, "failed", "", "", plain_error(exc, "could not be indexed")])
                 counts["failed"] += 1
                 continue
-            status = doc.status.value if isinstance(doc.status, DocumentStatus) else str(doc.status)
-            if status == DocumentStatus.failed.value:
-                counts["failed"] += 1
-            else:
-                counts["ready"] += 1
-            rows.append([display, status, str(doc.chunk_count), str(doc.pages or ""), doc.error or ""])
+            rows.append(_ingest_row(display, result, counts))
         rows.extend([name, "skipped", "", "", reason] for name, reason in skipped)
         print(" " * 60, end="\r")
         print(_table(["File", "Status", "Chunks", "Pages", "Note"], rows))
         print()
-        print(f"{counts['ready']} indexed, {counts['already indexed']} already indexed, {counts['failed']} failed, "
-              f"{counts['skipped']} skipped. Collection '{collection.name}', knowledge {deps.knowledge_version()}.")
+        print(f"{counts['ready']} ready, {counts['replaced']} replaced, {counts['duplicates']} duplicates "
+              f"(already indexed), {counts['failed']} failed, {counts['skipped']} skipped. "
+              f"Collection '{collection.name}', knowledge {deps.knowledge_version()}.")
         return EXIT_FAIL if counts["failed"] else EXIT_OK
     finally:
         deps.close()
+
+
+def _ingest_row(display: str, result: Any, counts: dict[str, int]) -> list[str]:
+    """One table row from the pipeline's result, counted once: ready, replaced, duplicate or failed."""
+    doc = result.document
+    chunks = str(doc.chunk_count) if doc is not None else ""
+    pages = str(doc.pages or "") if doc is not None else ""
+    status = str(getattr(doc.status, "value", doc.status)) if doc is not None else DocumentStatus.failed.value
+    if result.already_indexed:
+        counts["duplicates"] += 1
+        return [display, "already indexed", chunks, pages, ""]
+    if status != DocumentStatus.ready.value:
+        counts["failed"] += 1
+        error = (doc.error if doc is not None else None) or "could not be indexed"
+        return [display, DocumentStatus.failed.value, chunks, pages, error]
+    if result.replaced_doc_id:
+        counts["replaced"] += 1
+        return [display, "ready", chunks, pages, f"replaced {short_name(result.replaced_title or 'an older version')}"]
+    counts["ready"] += 1
+    return [display, "ready", chunks, pages, ""]
 
 
 def cmd_ask(args: argparse.Namespace) -> int:
@@ -370,6 +403,30 @@ def _data_dir_check(settings: Settings) -> tuple[bool, str]:
         return False, f"{folder} (not writable)"
 
 
+def _reranker_check(checks: list[dict[str, Any]], deps: Deps, settings: Settings) -> None:
+    """With RERANKER=local, load the reranker once (the first run downloads it), so the first question
+    does not wait on the download. Not essential: without it, search keeps the fused order."""
+    if settings.RERANKER != "local":
+        _check(checks, "Reranker", True, f"off (RAGKB_RERANKER={settings.RERANKER})", essential=False)
+        return
+    name = f"local ({settings.RERANK_MODEL})"
+    loader = getattr(deps.reranker, "load", None)
+    if not callable(loader):
+        reason = deps.problems.get("reranker", "not available")
+        _check(checks, "Reranker", False, f"{name}: {reason}; search keeps the fused order", essential=False)
+        return
+    started = time.perf_counter()
+    try:
+        loader()
+    except Exception as exc:  # noqa: BLE001 - each check reports its own failure
+        reason = plain_error(exc, f"could not be loaded or downloaded ({RERANK_DOWNLOAD_SIZE})")
+        _check(checks, "Reranker", False, f"{name}: {reason}; search keeps the fused order", essential=False)
+        return
+    ms = int((time.perf_counter() - started) * 1000)
+    _check(checks, "Reranker", True, f"{name}, loaded in {ms} ms ({RERANK_DOWNLOAD_SIZE}, downloaded on the first run)",
+           essential=False)
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     settings = _settings(args)
     _quiet_logs(settings)
@@ -380,7 +437,10 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     data_ok, data_detail = _data_dir_check(settings)
     _check(checks, "Data folder", data_ok, data_detail)
     if not args.json:
-        print("Checking (the first run downloads the embedding model, about 130 MB) ...", file=sys.stderr)
+        downloads = f"the embedding model, {EMBED_DOWNLOAD_SIZE}"
+        if settings.RERANKER == "local":
+            downloads += f", and the reranker, {RERANK_DOWNLOAD_SIZE}"
+        print(f"Checking (the first run downloads {downloads}) ...", file=sys.stderr)
     deps = build_deps(settings)
     providers: list[dict[str, Any]] = []
     provider_report: dict[str, Any] = {}
@@ -392,7 +452,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             try:
                 n = len(deps.meta.list_collections())
                 version = deps.knowledge_version() or "none yet"
-                _check(checks, "Metadata store", True, f"ok, {n} collections, knowledge {version}")
+                label = "collection" if n == 1 else "collections"
+                _check(checks, "Metadata store", True, f"ok, {n} {label}, knowledge {version}")
             except Exception as exc:  # noqa: BLE001 - each check reports its own failure
                 _check(checks, "Metadata store", False, plain_error(exc, "could not be read"))
         else:
@@ -420,10 +481,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             name = "fake embedder" if fake_embedder_requested() else settings.EMBED_MODEL
             _check(checks, "Embedding model", False, f"{name}: {deps.problems.get('embedder', 'not available')}")
 
-        reranker_ok = deps.reranker is not None or settings.RERANKER == "none"
-        _check(checks, "Reranker", reranker_ok,
-               settings.RERANKER if settings.RERANKER == "none" else f"local ({settings.RERANK_MODEL})",
-               essential=False)
+        _reranker_check(checks, deps, settings)
 
         if deps.providers is not None:
             try:

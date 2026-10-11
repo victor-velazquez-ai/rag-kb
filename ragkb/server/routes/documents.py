@@ -1,72 +1,76 @@
-"""Documents and ingestion jobs: upload, list, passages, original file, re-index, delete, progress."""
+"""Documents and ingestion jobs: upload, list, passages, original file, re-index, retry, delete, progress,
+cancel and the per-collection job summary."""
 from __future__ import annotations
 
-import re
+from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, File, Form, Query, UploadFile
+from fastapi import APIRouter, File, Form, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from ragkb.models import Chunk, Document
-from ragkb.server.deps import DepsDep, JobOut, supported_media_type, supported_types
+from ragkb.server.deps import DELETE_PENDING_MESSAGE, DepsDep, JobOut
 from ragkb.server.errors import ApiError
+from ragkb.server.text import clean_filename, clean_text
+from ragkb.server.uploads import Incoming, Rejection, accept_uploads, is_archive
 
 router = APIRouter(tags=["documents"])
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-
 
 class UploadResponse(BaseModel):
+    """Every file of the request is in exactly one list: ``jobs`` (accepted) or ``rejected`` (refused up
+    front, with a code; no document row). ``skipped`` counts zip entries left out on purpose (folders,
+    hidden files)."""
+
     jobs: list[JobOut]
-
-
-def clean_filename(raw: str | None) -> str:
-    """Keep only the base name, without folders or control characters."""
-    name = (raw or "").replace("\\", "/").rsplit("/", 1)[-1]
-    name = _CONTROL.sub("", name).strip().strip(".")
-    return name[:255]
-
-
-def _suffix(name: str) -> str:
-    return ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+    rejected: list[Rejection] = []
+    skipped: int = 0
 
 
 @router.post("/collections/{cid}/documents", response_model=UploadResponse, status_code=202)
 async def upload_documents(
     cid: str,
-    files: Annotated[list[UploadFile], File(description="One or many files.")],
+    files: Annotated[list[UploadFile], File(description="One or many files. A .zip archive is expanded.")],
     deps: DepsDep,
     title: Annotated[str | None, Form(max_length=300)] = None,
+    relative_paths: Annotated[
+        list[str] | None,
+        Form(description="For a folder upload: each file's path inside the folder, in the same order as files."),
+    ] = None,
 ) -> UploadResponse:
     deps.require("meta")
     deps.require("pipeline")
     await run_in_threadpool(deps.get_collection, cid)
-    title = " ".join(title.split()) if title else None
-    if title and len(files) > 1:
+    clean_title: str | None = None
+    if title is not None and title.strip():
+        clean_title = clean_text(title)
+        if not clean_title:
+            raise ApiError(400, "invalid_request", "The title has no visible characters.")
+    if relative_paths is not None and len(relative_paths) != len(files):
+        raise ApiError(400, "invalid_request",
+                       "relative_paths needs one entry per file, in the same order as files.")
+    if clean_title and (len(files) > 1 or is_archive(clean_filename(files[0].filename))):
         raise ApiError(400, "invalid_request", "A title can only be set when uploading a single file.")
-    cap = deps.settings.MAX_UPLOAD_MB * 1024 * 1024
-    staged: list[tuple[str, bytes]] = []
-    for upload in files:
-        name = clean_filename(upload.filename)
-        if not name:
-            raise ApiError(400, "invalid_request", "Every uploaded file needs a name.")
-        if supported_media_type(name) is None:
-            kinds = ", ".join(supported_types()) or "none"
-            raise ApiError(415, "unsupported_file_type",
-                           f"{name}: files of type {_suffix(name) or 'unknown'} are not supported. "
-                           f"Supported: {kinds}.")
-        data = await upload.read(cap + 1)
-        await upload.close()
-        if len(data) > cap:
-            raise ApiError(413, "file_too_large",
-                           f"{name} is larger than the {deps.settings.MAX_UPLOAD_MB} MB limit per file.")
-        if not data:
-            raise ApiError(400, "empty_document", f"{name} is empty.")
-        staged.append((name, data))
-    jobs = [await run_in_threadpool(deps.submit_upload, cid, name, data, title) for name, data in staged]
-    return UploadResponse(jobs=jobs)
+    items = [
+        Incoming(upload.filename or "", upload.file, (relative_paths[i] or None) if relative_paths else None)
+        for i, upload in enumerate(files)
+    ]
+    try:
+        outcome = await run_in_threadpool(accept_uploads, deps, cid, items, clean_title)
+    finally:
+        for upload in files:
+            await upload.close()
+    if not outcome.jobs:
+        if not outcome.rejected:
+            raise ApiError(400, "invalid_request", "The upload holds no files to index.")
+        first = outcome.rejected[0]
+        message = first.message
+        if len(outcome.rejected) > 1:
+            message = f"None of the {len(outcome.rejected)} files could be added. {first.message}"
+        raise ApiError(outcome.first_status, first.code, message)
+    return UploadResponse(jobs=outcome.jobs, rejected=outcome.rejected, skipped=outcome.skipped)
 
 
 @router.get("/collections/{cid}/documents", response_model=list[Document])
@@ -81,9 +85,27 @@ def list_jobs(cid: str, deps: DepsDep, limit: Annotated[int, Query(ge=1, le=500)
     return deps.list_jobs(cid, limit=limit)
 
 
+@router.get("/collections/{cid}/jobs/summary")
+def jobs_summary(
+    cid: str,
+    deps: DepsDep,
+    since: Annotated[datetime | None, Query(description="ISO 8601 time; the default is 24 hours ago.")] = None,
+) -> dict[str, Any]:
+    """How the collection's recent jobs ended: queued, processing, ready, failed, cancelled, replaced,
+    duplicates and total. Each job counts once."""
+    return deps.jobs_summary(cid, since)
+
+
 @router.get("/jobs/{jid}", response_model=JobOut)
 def get_job(jid: str, deps: DepsDep) -> JobOut:
     return deps.get_job(jid)
+
+
+@router.post("/jobs/{jid}/cancel", response_model=JobOut)
+def cancel_job(jid: str, deps: DepsDep) -> JobOut:
+    """A waiting job ends as cancelled at once; a running one stops at its next step and keeps any
+    previous version. A finished job comes back unchanged."""
+    return deps.cancel_job(jid)
 
 
 @router.get("/documents/{did}", response_model=Document)
@@ -119,7 +141,16 @@ def reindex_document(did: str, deps: DepsDep) -> JobOut:
     return deps.submit_reindex(did)
 
 
+@router.post("/documents/{did}/retry", response_model=JobOut, status_code=202)
+def retry_document(did: str, deps: DepsDep) -> JobOut:
+    """Index a failed document again from its kept original; its error is cleared while it waits."""
+    return deps.submit_reindex(did, retry=True)
+
+
 @router.delete("/documents/{did}")
-def delete_document(did: str, deps: DepsDep) -> dict[str, Any]:
-    deps.delete_document(did)
+def delete_document(did: str, deps: DepsDep, response: Response) -> dict[str, Any]:
+    """200 when the document is gone; 202 with ``pending`` when the delete continues in the background."""
+    if not deps.delete_document(did):
+        response.status_code = 202
+        return {"deleted": did, "pending": True, "message": DELETE_PENDING_MESSAGE}
     return {"deleted": did, "knowledge_version": deps.knowledge_version()}

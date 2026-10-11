@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import importlib
 import json
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from ragkb import cli
+from ragkb.models import Answer, AnswerStatus, Citation
+from ragkb.server.deps import Deps
+from tests.test_api import PART_A, PART_A_REASON, FakePipeline, MemoryMeta
 
 CORE_PARTS = (
     "ragkb.store.sqlite_meta",
@@ -39,6 +44,8 @@ def offline(monkeypatch):
     monkeypatch.setenv("RAGKB_FAKE_EMBEDDER", "1")
     monkeypatch.setenv("RAGKB_PROVIDER", "extractive")
     monkeypatch.setenv("RAGKB_LOG_LEVEL", "WARNING")
+    # The reranker is on by default; the offline tests never download its model.
+    monkeypatch.setenv("RAGKB_RERANKER", "none")
 
 
 def test_parse_serve():
@@ -104,8 +111,38 @@ def test_doctor_smoke(tmp_path, capsys):
 
 def test_doctor_text_output(tmp_path, capsys):
     cli.main(["doctor", "--data-dir", str(tmp_path / "data")])
-    out = capsys.readouterr().out
-    assert "Python" in out and "Data folder" in out
+    captured = capsys.readouterr()
+    assert "Python" in captured.out and "Data folder" in captured.out
+    assert "Reranker: off (RAGKB_RERANKER=none)" in captured.out
+    assert "embedding model, about 130 MB)" in captured.err and "reranker" not in captured.err
+
+
+def test_doctor_loads_the_reranker_once_and_names_the_download(tmp_path, monkeypatch, capsys):
+    reranker_mod = pytest.importorskip("ragkb.retrieval.reranker")
+    loaded: list[str] = []
+
+    class FakeCrossEncoder:
+        def __init__(self, model_name: str) -> None:
+            loaded.append(model_name)
+
+    monkeypatch.setenv("RAGKB_RERANKER", "local")
+    monkeypatch.setattr(reranker_mod, "TextCrossEncoder", FakeCrossEncoder)
+    cli.main(["doctor", "--data-dir", str(tmp_path / "data")])
+    captured = capsys.readouterr()
+    assert loaded == ["Xenova/ms-marco-MiniLM-L-6-v2"]
+    assert "and the reranker, about 90 MB) ..." in captured.err
+    line = next(line for line in captured.out.splitlines() if "Reranker:" in line)
+    assert line.startswith("[  ok] Reranker: local (Xenova/ms-marco-MiniLM-L-6-v2), loaded in ")
+    assert "about 90 MB, downloaded on the first run" in line
+
+    def offline_hub(model_name: str) -> None:
+        raise OSError("no connection to the model hub")
+
+    monkeypatch.setattr(reranker_mod, "TextCrossEncoder", offline_hub)
+    assert cli.main(["doctor", "--data-dir", str(tmp_path / "data2"), "--json"]) in (0, 1)
+    check = next(c for c in json.loads(capsys.readouterr().out)["checks"] if c["name"] == "Reranker")
+    assert check["ok"] is False and check["essential"] is False
+    assert "search keeps the fused order" in check["detail"]
 
 
 def test_eval_needs_a_golden_set(tmp_path, capsys):
@@ -148,8 +185,54 @@ def test_eval_offline_on_the_sample_golden_set_passes(tmp_path, capsys):
     assert "GATE PASS" in out and "false-answer rate 0.00" in out
 
 
+def test_ingest_reports_each_outcome_and_a_summary(tmp_path, monkeypatch, capsys):
+    meta = MemoryMeta()
+    pipeline = FakePipeline(meta)
+    monkeypatch.setattr(cli, "build_deps", lambda settings, **kwargs: Deps(settings=settings, meta=meta,
+                                                                             pipeline=pipeline))
+    docs = tmp_path / "handbook"
+    docs.mkdir()
+    (docs / "leave.md").write_text("# Leave\n\nVersion one.\n", encoding="utf-8")
+    (docs / "expenses.txt").write_text("Expenses are paid monthly.\n", encoding="utf-8")
+    data = str(tmp_path / "data")
+
+    assert cli.main(["ingest", str(docs), "--collection", "Team", "--data-dir", data]) == 0
+    out = capsys.readouterr().out
+    assert "2 ready, 0 replaced, 0 duplicates (already indexed), 0 failed, 0 skipped" in out
+    assert sorted(c["source_path"] for c in pipeline.calls) == ["handbook/expenses.txt", "handbook/leave.md"]
+
+    (docs / "leave.md").write_text("# Leave\n\nVersion two.\n", encoding="utf-8")
+    (docs / "broken-scan.md").write_text("unreadable", encoding="utf-8")
+    assert cli.main(["ingest", str(docs), "--collection", "Team", "--data-dir", data]) == 1
+    out = capsys.readouterr().out
+    rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("handbook/")}
+    assert "ready" in rows["handbook/leave.md"] and "replaced leave" in rows["handbook/leave.md"]
+    assert "already indexed" in rows["handbook/expenses.txt"]
+    assert "failed" in rows["handbook/broken-scan.md"] and "could not be read" in rows["handbook/broken-scan.md"]
+    assert "0 ready, 1 replaced, 1 duplicates (already indexed), 1 failed, 0 skipped" in out
+
+
+def test_ask_prints_the_closest_passages_when_not_covered():
+    now = datetime.now(UTC)
+    closest = [Citation(marker=1, chunk_id="d1#0", doc_id="d1", title="Office rules", page=2, section="Pets",
+                        snippet="Dogs are not allowed in the office, except assistance dogs.", score=0.42)]
+    declined = Answer(id=uuid.uuid4().hex, question="Can I bring my cat?", collection_id="c1",
+                      status=AnswerStatus.no_answer, message="The knowledge base does not cover this question.",
+                      closest=closest, created_at=now)
+    text = cli.format_answer(declined)
+    assert text.startswith("Not covered: The knowledge base does not cover this question.")
+    assert "Closest passages" in text and "1. Office rules (p. 2, Pets)" in text
+    assert "Dogs are not allowed in the office" in text
+
+    answered = declined.model_copy(update={"status": AnswerStatus.answered, "answer": "No pets [1].",
+                                           "message": None})
+    assert "Closest passages" not in cli.format_answer(answered)
+
+
 def test_ingest_then_ask(tmp_path, capsys):
     _require(*CORE_PARTS, *ANSWER_PARTS)
+    if not PART_A:
+        pytest.skip(PART_A_REASON)
     docs = tmp_path / "docs"
     (docs / "nested").mkdir(parents=True)
     (docs / "leave.md").write_text(
@@ -163,8 +246,8 @@ def test_ingest_then_ask(tmp_path, capsys):
 
     assert cli.main(["ingest", str(docs), "--collection", "Handbook", "--data-dir", data]) == 0
     out = capsys.readouterr().out
-    assert "leave.md" in out and "nested/expenses.txt" in out and "ignore.bin" not in out
-    assert "2 indexed" in out
+    assert "docs/leave.md" in out and "docs/nested/expenses.txt" in out and "ignore.bin" not in out
+    assert "2 ready, 0 replaced, 0 duplicates" in out
 
     assert cli.main(["ingest", str(docs / "leave.md"), "--collection", "Handbook", "--data-dir", data]) == 0
     assert "already indexed" in capsys.readouterr().out

@@ -1,13 +1,18 @@
-"""Collections: list, create, delete with all documents, and stats."""
+"""Collections: list, create, delete with all documents, and stats.
+
+Counts follow one rule everywhere: ``documents`` is the number of ready (searchable) documents;
+``documents_total`` and ``documents_by_status`` carry the rest.
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from pydantic import BaseModel, Field, field_validator
 
 from ragkb.models import Collection
-from ragkb.server.deps import CollectionOut, DepsDep
+from ragkb.server.deps import DELETE_PENDING_MESSAGE, CollectionOut, DepsDep
+from ragkb.server.text import clean_text
 
 router = APIRouter(tags=["collections"])
 
@@ -18,16 +23,16 @@ class CollectionCreate(BaseModel):
 
     @field_validator("name")
     @classmethod
-    def _name_not_blank(cls, value: str) -> str:
-        value = " ".join(value.split())
+    def _clean_name(cls, value: str) -> str:
+        value = clean_text(value)
         if not value:
-            raise ValueError("name must not be blank")
+            raise ValueError("name must have visible characters")
         return value
 
     @field_validator("description")
     @classmethod
-    def _trim(cls, value: str) -> str:
-        return value.strip()
+    def _clean_description(cls, value: str) -> str:
+        return clean_text(value)
 
 
 @router.get("/collections", response_model=list[CollectionOut])
@@ -41,8 +46,12 @@ def create_collection(body: CollectionCreate, deps: DepsDep) -> Collection:
 
 
 @router.delete("/collections/{cid}")
-def delete_collection(cid: str, deps: DepsDep) -> dict[str, Any]:
-    removed = deps.delete_collection(cid)
+def delete_collection(cid: str, deps: DepsDep, response: Response) -> dict[str, Any]:
+    """200 when the collection is gone; 202 with ``pending`` when the delete continues in the background."""
+    removed, done = deps.delete_collection(cid)
+    if not done:
+        response.status_code = 202
+        return {"deleted": cid, "documents_deleted": removed, "pending": True, "message": DELETE_PENDING_MESSAGE}
     return {"deleted": cid, "documents_deleted": removed, "knowledge_version": deps.knowledge_version()}
 
 

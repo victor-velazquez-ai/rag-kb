@@ -7,19 +7,22 @@ installed (or fails to start) the container records a plain problem, the health 
 """
 from __future__ import annotations
 
-import hashlib
+import inspect
 import logging
 import os
 import threading
 import time
+import uuid
 from collections import Counter, OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, Request
+from pydantic import Field
 
 from ragkb import __version__
 from ragkb.config import Settings, get_settings
@@ -29,11 +32,15 @@ from ragkb.models import (
     Collection,
     Document,
     DocumentStatus,
+    Feedback,
     Job,
     ProviderStatus,
 )
 from ragkb.providers.base import ProviderError
+from ragkb.server.counts import IN_PROGRESS, document_counts, headline, status_value
 from ragkb.server.errors import ApiError, plain_error
+from ragkb.server.jobs import IngestScheduler, QueuedJob, SchedulerStopped
+from ragkb.server.text import clean_text
 
 log = logging.getLogger("ragkb.server")
 
@@ -83,10 +90,27 @@ except Exception as _exc:  # noqa: BLE001 - a missing or broken part must not st
     _IMPORT_PROBLEMS["ingestion"] = f"{type(_exc).__name__}: {_exc}"
 
 try:
-    from ragkb.ingest.parsers import SUPPORTED_SUFFIXES, media_type_for
+    from ragkb.ingest.pipeline import IngestCancelled
+except Exception:  # noqa: BLE001 - an ingestion part without cancellation still runs
+
+    class IngestCancelled(Exception):  # type: ignore[no-redef]
+        """Stand-in so the except clause in the job runner stays valid without the ingestion part."""
+
+try:
+    from ragkb.ingest.parsers import (
+        SUPPORTED_SUFFIXES,
+        EncryptedFileError,
+        check_data_not_encrypted,
+        media_type_for,
+    )
 except Exception as _exc:  # noqa: BLE001 - a missing or broken part must not stop the app
     SUPPORTED_SUFFIXES = frozenset()  # type: ignore[assignment]
     media_type_for = None  # type: ignore[assignment]
+    check_data_not_encrypted = None  # type: ignore[assignment]
+
+    class EncryptedFileError(Exception):  # type: ignore[no-redef]
+        """Stand-in so the except clause in encrypted_reason stays valid without the parsers part."""
+
     _IMPORT_PROBLEMS["parsers"] = f"{type(_exc).__name__}: {_exc}"
 
 try:
@@ -111,6 +135,25 @@ ASK_LIMIT_PER_MINUTE = 30
 MCP_TOOLS: tuple[str, ...] = ("list_collections", "list_documents", "search_knowledge_base", "ask_knowledge_base")
 PROVIDER_LABELS: dict[str, str] = {"claude_code": "Claude Code", "codex": "Codex", "extractive": "Extractive mode"}
 SEARCH_UNAVAILABLE = "Search is unavailable right now."
+
+# Ingestion jobs
+OPEN_STATUSES = frozenset(IN_PROGRESS)
+SPOOL_DIR = ".incoming"  # under the uploads folder: uploads waiting for a worker
+PROGRESS_FIELDS = ("stage", "chunks_done", "chunks_total", "eta_seconds")
+PROGRESS_INTERVAL_S = 0.5
+DELETE_WAIT_S = 15.0
+SUMMARY_WINDOW = timedelta(hours=24)
+JOB_SCAN_LIMIT = 100_000
+FEEDBACK_SCAN_LIMIT = 10_000
+INTERRUPTED_MESSAGE = "Indexing stopped because the server was shut down. Try again."
+SHUTDOWN_MESSAGE = "The server stopped before this file was indexed. Upload it again."
+SPOOL_LOST_MESSAGE = "The uploaded file was lost before it could be indexed. Upload it again."
+SPOOL_WRITE_MESSAGE = "The file could not be saved for indexing. Check the free disk space and try again."
+DELETE_PENDING_MESSAGE = "The delete is still running and will finish in the background."
+
+# Health fields shown to a caller that is not on this machine: nothing that names a local folder,
+# a user or a program path.
+PUBLIC_HEALTH_KEYS = ("status", "version", "knowledge_version", "counts", "store", "problems", "api", "mcp")
 
 _COMPONENT_LABELS: dict[str, str] = {
     "meta": "metadata store",
@@ -143,8 +186,27 @@ def provider_label(name: str | None) -> str:
     return PROVIDER_LABELS.get(name, name)
 
 
-def status_value(value: Any) -> str:
-    return str(getattr(value, "value", value))
+def accepts_keyword(fn: Callable[..., Any], name: str) -> bool:
+    """Whether ``fn`` takes the keyword argument ``name`` (or any keyword)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def compose_search_options(retriever: Any, settings: Settings) -> dict[str, Any]:
+    """Keyword arguments for ``Retriever.search`` when the passages go to the composer: the context
+    budget, so the retriever returns every passage that fits plus neighbours of the best ones. A
+    retriever without that keyword (a test double) is called with the plain arguments."""
+    search = getattr(retriever, "search", None)
+    if callable(search) and accepts_keyword(search, "budget_chars"):
+        return {"budget_chars": settings.MAX_CONTEXT_CHARS}
+    return {}
+
+
+class JobInputMissing(RuntimeError):
+    """A queued upload's spooled bytes are gone. The message is safe to show."""
 
 
 class RateLimiter:
@@ -171,12 +233,10 @@ class RateLimiter:
 
 @dataclass
 class JobExtra:
-    """What the job table does not hold: the kind of job, the file name and the dedupe outcome."""
+    """What the job table does not hold: the kind of job and the folder path of an upload."""
 
     kind: str
-    filename: str | None = None
-    already_indexed: bool = False
-    doc_id: str | None = None
+    source_path: str = ""
 
 
 class JobTracker:
@@ -197,23 +257,31 @@ class JobTracker:
         with self._lock:
             return self._items.get(job_id)
 
-    def set_doc(self, job_id: str, doc_id: str) -> None:
-        with self._lock:
-            extra = self._items.get(job_id)
-            if extra is not None:
-                extra.doc_id = doc_id
-
 
 class JobOut(Job):
-    """A job as the API returns it. ``doc_id`` is empty until a new upload has created its document."""
+    """A job as the API returns it. ``doc_id`` is empty until a new upload has created its document.
+
+    ``kind`` is upload, reindex or retry; ``source_path`` is the file's path in a folder or zip upload.
+    Both are known to the server process that ran the job (after a restart a job reads as an upload).
+    """
 
     kind: str = "upload"
-    filename: str | None = None
-    already_indexed: bool = False
+    source_path: str = ""
 
 
 class CollectionOut(Collection):
+    """``documents`` counts the ready (searchable) documents; the rest are in ``documents_by_status``."""
+
     documents: int = 0
+    documents_total: int = 0
+    documents_by_status: dict[str, int] = Field(default_factory=dict)
+
+
+def _log_background_failure(future: Future[Any]) -> None:
+    error = future.exception()
+    if error is not None:
+        log.warning("a delete that finished in the background failed",
+                    exc_info=(type(error), error, error.__traceback__))
 
 
 @dataclass
@@ -226,14 +294,21 @@ class Deps:
     retriever: Any = None
     pipeline: Any = None
     providers: Any = None
-    executor: ThreadPoolExecutor = field(
-        default_factory=lambda: ThreadPoolExecutor(max_workers=2, thread_name_prefix="ragkb-ingest")
+    scheduler: IngestScheduler | None = None
+    # deletes run here, apart from the ingestion workers, and the request waits up to delete_wait_s
+    maintenance: ThreadPoolExecutor = field(
+        default_factory=lambda: ThreadPoolExecutor(max_workers=2, thread_name_prefix="ragkb-delete")
     )
+    delete_wait_s: float = DELETE_WAIT_S
     ask_limiter: RateLimiter = field(default_factory=lambda: RateLimiter(ASK_LIMIT_PER_MINUTE, 60.0))
     jobs: JobTracker = field(default_factory=JobTracker)
     problems: dict[str, str] = field(default_factory=dict)
     fake_embedder: bool = False
     mcp_mounted: bool = False
+
+    def __post_init__(self) -> None:
+        if self.scheduler is None:
+            self.scheduler = IngestScheduler(self.settings.INGEST_WORKERS, self._run_job)
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -250,7 +325,11 @@ class Deps:
         return value
 
     def close(self) -> None:
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        """Stop the workers (jobs that never started end as failed), then close the stores."""
+        if self.scheduler is not None:
+            for item in self.scheduler.shutdown():
+                self._abandon(item, SHUTDOWN_MESSAGE)
+        self.maintenance.shutdown(wait=False)
         for component in (self.store, self.meta):
             closer = getattr(component, "close", None)
             if callable(closer):
@@ -294,9 +373,9 @@ class Deps:
 
     def find_collection_by_name(self, name: str) -> Collection | None:
         meta = self.require("meta")
-        wanted = " ".join(name.split()).casefold()
+        wanted = clean_text(name).casefold()
         for collection in meta.list_collections():
-            if " ".join(collection.name.split()).casefold() == wanted:
+            if clean_text(collection.name).casefold() == wanted:
                 return collection
         return None
 
@@ -305,52 +384,94 @@ class Deps:
         out: list[CollectionOut] = []
         for collection in meta.list_collections():
             try:
-                count = len(meta.list_documents(collection.id))
-            except Exception:  # noqa: BLE001 - a count is optional; the list must still load
-                count = 0
-            out.append(CollectionOut(**collection.model_dump(), documents=count))
+                counts = headline(document_counts(meta, collection.id))
+            except Exception:  # a count is optional; the list must still load
+                log.warning("could not count a collection's documents", exc_info=True)
+                counts = headline({})
+            out.append(CollectionOut(**collection.model_dump(), **counts))
         return out
 
     def create_collection(self, name: str, description: str = "") -> Collection:
         meta = self.require("meta")
+        name, description = clean_text(name), clean_text(description)
+        if not name:
+            raise ApiError(400, "invalid_request", "The collection name has no visible characters.")
         if self.find_collection_by_name(name) is not None:
             raise ApiError(409, "conflict", "A collection with this name already exists.")
         collection = meta.create_collection(name, description)
         self.audit("collection_created", collection_id=collection.id, name=collection.name)
         return collection
 
-    def delete_collection(self, collection_id: str) -> int:
+    def delete_collection(self, collection_id: str) -> tuple[int, bool]:
         """Delete every document (chunks, metadata and originals), then the collection itself.
 
-        Returns the number of documents removed.
+        Waiting and running jobs of the collection are cancelled first. Returns the number of
+        documents and whether the delete finished within ``delete_wait_s`` (it continues otherwise).
         """
         meta = self.require("meta")
         self.get_collection(collection_id)
-        documents = len(meta.list_documents(collection_id))
+        documents = int(sum(document_counts(meta, collection_id).values()))
+        for job_id in self.scheduler.active(collection_id=collection_id):
+            self._cancel_quietly(job_id)
+        return documents, self._bounded(self._delete_collection_now, collection_id, documents)
+
+    def _delete_collection_now(self, collection_id: str, documents: int) -> None:
         remover = getattr(self.pipeline, "delete_collection", None)
         if callable(remover):
-            remover(collection_id)  # removes chunks, rows and originals, bumps the version, audits
-            return documents
-        for doc in meta.list_documents(collection_id):
-            self.delete_document(doc.id)
+            try:
+                remover(collection_id)  # removes chunks, rows and originals, bumps the version, audits
+            except Exception as exc:
+                if getattr(exc, "code", None) == "not_found":  # deleted meanwhile by another request
+                    raise ApiError(404, "not_found", "Collection not found.") from None
+                raise
+            return
+        for doc in self.meta.list_documents(collection_id):
+            self._delete_document_now(doc)
         if self.store is not None:
             try:
                 self.store.delete_collection(collection_id)
             except Exception:
                 log.warning("could not sweep the collection's chunks", exc_info=True)
-        meta.delete_collection(collection_id)
+        self.meta.delete_collection(collection_id)
         self.audit("delete_collection", collection_id=collection_id, documents=documents)
-        return documents
 
-    def delete_document(self, doc_id: str) -> None:
+    def delete_document(self, doc_id: str) -> bool:
+        """Delete a document now, apart from the ingestion workers.
+
+        Its waiting or running jobs are cancelled first. Returns True when the delete finished within
+        ``delete_wait_s``, False when it is still running (it finishes in the background).
+        """
         doc = self.get_document(doc_id)
+        for job_id in self.scheduler.active(doc_id=doc_id):
+            self._cancel_quietly(job_id)
+        return self._bounded(self._delete_document_now, doc)
+
+    def _delete_document_now(self, doc: Document) -> None:
         if self.pipeline is not None:
-            self.pipeline.delete(doc_id)  # removes chunks, row and original, bumps the version, audits
+            try:
+                self.pipeline.delete(doc.id)  # removes chunks, row and original, bumps the version, audits
+            except Exception as exc:
+                if getattr(exc, "code", None) == "not_found":
+                    raise ApiError(404, "not_found", "Document not found.") from None
+                raise
             return
         if self.store is not None:
-            self.store.delete_doc(doc_id)
-        self.meta.delete_document(doc_id)
-        self.audit("delete", collection_id=doc.collection_id, doc_id=doc_id)
+            self.store.delete_doc(doc.id)
+        self.meta.delete_document(doc.id)
+        self.audit("delete", collection_id=doc.collection_id, doc_id=doc.id)
+
+    def _bounded(self, fn: Callable[..., Any], *args: Any) -> bool:
+        """Run ``fn`` off the ingestion workers and wait up to ``delete_wait_s``: True when it finished."""
+        future = self.maintenance.submit(fn, *args)
+        try:
+            future.result(timeout=self.delete_wait_s)
+        except TimeoutError:
+            if future.done():
+                raise
+            future.add_done_callback(_log_background_failure)
+            log.warning("a delete is taking longer than expected and continues in the background")
+            return False
+        return True
 
     def has_documents(self, collection_id: str) -> bool:
         if self.store is not None:
@@ -386,15 +507,13 @@ class Deps:
                 return resolved
         return None
 
-    # ------------------------------------------------------------------ jobs
+    # ------------------------------------------------------------------ jobs: reading
 
     def job_view(self, job: Job) -> JobOut:
         extra = self.jobs.get(job.id)
         data = job.model_dump()
         if extra is not None:
-            if extra.doc_id and not data.get("doc_id"):
-                data["doc_id"] = extra.doc_id
-            data.update(kind=extra.kind, filename=extra.filename, already_indexed=extra.already_indexed)
+            data.update(kind=extra.kind, source_path=extra.source_path)
         return JobOut(**data)
 
     def get_job(self, job_id: str) -> JobOut:
@@ -409,72 +528,301 @@ class Deps:
         self.get_collection(collection_id)
         return [self.job_view(job) for job in meta.list_jobs(collection_id, limit=limit)]
 
-    def submit_upload(self, collection_id: str, filename: str, data: bytes, title: str | None) -> JobOut:
-        """Create a queued job for one file and run it in the ingestion pool; report a known hash at once."""
-        meta = self.require("meta")
-        self.require("pipeline")
-        existing = meta.find_by_hash(collection_id, hashlib.sha256(data).hexdigest())
-        if existing is not None and existing.status == DocumentStatus.ready:
-            job = meta.create_job(collection_id, existing.id)
-            job = meta.update_job(job.id, DocumentStatus.ready)
-            self.jobs.put(job.id, JobExtra("upload", filename, already_indexed=True, doc_id=existing.id))
-            # Same shape as the pipeline's own duplicate event, so the audit trail reads the same either way.
-            self.audit("ingest", collection_id=collection_id, doc_id=existing.id, title=existing.title,
-                       filename=filename, outcome="duplicate")
-            return self.job_view(job)
-        doc_id = existing.id if existing is not None else ""
-        job = meta.create_job(collection_id, doc_id)
-        self.jobs.put(job.id, JobExtra("upload", filename, doc_id=doc_id or None))
-        self.executor.submit(self._run_upload, job.id, collection_id, filename, data, title)
-        return self.job_view(job)
+    def jobs_summary(self, collection_id: str, since: datetime | None = None) -> dict[str, Any]:
+        """Counts of the collection's jobs created since ``since`` (default: the last 24 hours).
 
-    def submit_reindex(self, doc_id: str) -> JobOut:
+        Each job counts once: ``replaced`` and ``duplicates`` are finished jobs that replaced an older
+        version or matched an indexed file, and are not also counted in ``ready``.
+        """
+        meta = self.require("meta")
+        self.get_collection(collection_id)
+        since = since or utcnow() - SUMMARY_WINDOW
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=UTC)
+        counts = dict.fromkeys(("queued", "processing", "ready", "failed", "cancelled", "replaced", "duplicates"), 0)
+        for job in meta.list_jobs(collection_id, limit=JOB_SCAN_LIMIT):
+            created = job.created_at if job.created_at.tzinfo else job.created_at.replace(tzinfo=UTC)
+            if created < since:
+                continue
+            status = status_value(job.status)
+            if status == "ready" and job.already_indexed:
+                counts["duplicates"] += 1
+            elif status == "ready" and job.replaced_doc_id:
+                counts["replaced"] += 1
+            elif status in counts:
+                counts[status] += 1
+        return {"collection_id": collection_id, "since": since.isoformat(), **counts, "total": sum(counts.values())}
+
+    # ------------------------------------------------------------------ jobs: submitting
+
+    def submit_upload(self, collection_id: str, filename: str, data: bytes, *, title: str | None = None,
+                      source_path: str | None = None) -> JobOut:
+        """Queue one accepted file. Bytes already indexed in the collection are reported at once."""
+        self.require("meta")
+        pipeline = self.require("pipeline")
+        duplicate = pipeline.find_duplicate(collection_id, data)
+        if duplicate is not None and status_value(duplicate.status) == DocumentStatus.ready.value:
+            return self._duplicate_job(collection_id, filename, len(data), duplicate, source_path)
+        job = self.meta.create_job(collection_id, "", filename=filename, bytes_total=len(data))
+        self.jobs.put(job.id, JobExtra("upload", source_path or ""))
+        try:
+            spool = self._spool(job.id, data)
+        except OSError:
+            log.warning("could not spool an upload", exc_info=True, extra={"job_id": job.id})
+            self._update_job(job.id, DocumentStatus.failed, SPOOL_WRITE_MESSAGE, stage="failed")
+            return self.get_job(job.id)
+        item = QueuedJob(job.id, "upload", collection_id, len(data), filename=filename, title=title,
+                         source_path=source_path, spool=spool)
+        return self._enqueue(item, job)
+
+    def _duplicate_job(self, collection_id: str, filename: str, size: int, duplicate: Document,
+                       source_path: str | None) -> JobOut:
+        job = self.meta.create_job(collection_id, duplicate.id, filename=filename, bytes_total=size)
+        self.jobs.put(job.id, JobExtra("upload", source_path or ""))
+        self._update_job(job.id, DocumentStatus.ready, doc_id=duplicate.id, stage="done", already_indexed=True,
+                         chunks_done=duplicate.chunk_count, chunks_total=duplicate.chunk_count)
+        # Same shape as the pipeline's own duplicate event, so the audit trail reads the same either way.
+        self.audit("ingest", collection_id=collection_id, doc_id=duplicate.id, title=duplicate.title,
+                   filename=filename, outcome="duplicate")
+        return self.get_job(job.id)
+
+    def submit_reindex(self, doc_id: str, *, retry: bool = False) -> JobOut:
+        """Queue a re-index from the kept original. A retry is for a failed document and clears its error."""
         meta = self.require("meta")
         self.require("pipeline")
         doc = self.get_document(doc_id)
-        job = meta.create_job(doc.collection_id, doc.id)
-        self.jobs.put(job.id, JobExtra("reindex", doc.filename, doc_id=doc.id))
-        self.executor.submit(self._run_reindex, job.id, doc.id)
+        if retry and status_value(doc.status) != DocumentStatus.failed.value:
+            raise ApiError(409, "conflict", "Only a document that failed can be retried. Use re-index for the others.")
+        if self.scheduler.active(doc_id=doc.id):
+            raise ApiError(409, "conflict", "This document is already waiting or being indexed.")
+        kind = "retry" if retry else "reindex"
+        job = meta.create_job(doc.collection_id, doc.id, filename=doc.filename, bytes_total=doc.size_bytes)
+        self.jobs.put(job.id, JobExtra(kind, doc.source_path))
+        item = QueuedJob(job.id, kind, doc.collection_id, doc.size_bytes, doc_id=doc.id, filename=doc.filename)
+        if retry:
+            item.previous_error = doc.error
+            meta.update_document(doc.id, status=DocumentStatus.queued, error=None)
+        return self._enqueue(item, job)
+
+    def _enqueue(self, item: QueuedJob, job: Job) -> JobOut:
+        try:
+            self.scheduler.submit(item)
+        except SchedulerStopped:
+            self._abandon(item, SHUTDOWN_MESSAGE)
+            return self.get_job(item.job_id)
         return self.job_view(job)
 
-    def _set_job(self, job_id: str, status: DocumentStatus, error: str | None = None, *,
-                 doc_id: str | None = None) -> None:
+    def _spool_dir(self) -> Path:
+        return self.settings.uploads_dir / SPOOL_DIR
+
+    def _spool(self, job_id: str, data: bytes) -> Path:
+        folder = self._spool_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / job_id
+        path.write_bytes(data)
+        return path
+
+    @staticmethod
+    def _drop_spool(item: QueuedJob) -> None:
+        if item.spool is not None:
+            try:
+                item.spool.unlink(missing_ok=True)
+            except OSError:
+                log.warning("could not remove a spooled upload", exc_info=True, extra={"job_id": item.job_id})
+
+    # ------------------------------------------------------------------ jobs: running
+
+    def _update_job(self, job_id: str, status: DocumentStatus | None = None, error: str | None = None, *,
+                    doc_id: str | None = None, **progress: Any) -> None:
         try:
-            self.meta.update_job(job_id, status, error, doc_id=doc_id)
+            self.meta.update_job(job_id, status, error, doc_id=doc_id, **progress)
         except Exception:
             log.warning("could not update a job", exc_info=True, extra={"job_id": job_id})
 
-    def _finish_from_document(self, job_id: str, doc: Document | None, fallback: str) -> None:
-        """Close the job and record the document it produced, so the link survives a restart."""
+    def _cancel_requested(self, job_id: str) -> bool:
+        try:
+            return bool(self.meta.cancel_requested(job_id))
+        except Exception:
+            log.warning("could not read a job's cancel flag", exc_info=True, extra={"job_id": job_id})
+            return False
+
+    def _progress_writer(self, job_id: str) -> Callable[[Mapping[str, Any]], None]:
+        """The pipeline's progress callback: writes stage, chunk counts and ETA to the job, at most every
+        half second within one stage (a new stage, or the last chunk, is always written)."""
+        last: dict[str, Any] = {"stage": None, "at": 0.0}
+
+        def write(info: Mapping[str, Any]) -> None:
+            now = time.monotonic()
+            stage = info.get("stage")
+            done, total = info.get("chunks_done"), info.get("chunks_total")
+            finished = total is not None and done is not None and done >= total
+            if stage == last["stage"] and now - last["at"] < PROGRESS_INTERVAL_S and not finished:
+                return
+            last.update(stage=stage, at=now)
+            self._update_job(job_id, **{key: info[key] for key in PROGRESS_FIELDS if key in info})
+
+        return write
+
+    def _read_spool(self, item: QueuedJob) -> bytes:
+        try:
+            if item.spool is None:
+                raise OSError("no spooled upload")
+            return item.spool.read_bytes()
+        except OSError:
+            raise JobInputMissing(SPOOL_LOST_MESSAGE) from None
+
+    def _run_job(self, item: QueuedJob) -> None:
+        """One job on a worker: queued becomes processing, then ready, failed or cancelled."""
+        try:
+            if self._cancel_requested(item.job_id):
+                self._end_cancelled(item)
+                return
+            self._update_job(item.job_id, DocumentStatus.processing, stage="parsing")
+            progress = self._progress_writer(item.job_id)
+            fallback = ("The file could not be indexed." if item.kind == "upload"
+                        else "The document could not be re-indexed.")
+            try:
+                if item.kind == "upload":
+                    result = self.pipeline.ingest_bytes(
+                        item.collection_id, self._read_spool(item), item.filename, title=item.title,
+                        source_path=item.source_path, job_id=item.job_id, progress=progress)
+                else:
+                    result = self.pipeline.reindex(item.doc_id, job_id=item.job_id, progress=progress)
+            except IngestCancelled:
+                self._end_cancelled(item)
+            except Exception as exc:
+                log.warning("ingestion failed", exc_info=True, extra={"job_id": item.job_id, "kind": item.kind})
+                self._update_job(item.job_id, DocumentStatus.failed, plain_error(exc, fallback), stage="failed")
+            else:
+                self._finish(item, result, fallback)
+        finally:
+            self._drop_spool(item)
+
+    def _finish(self, item: QueuedJob, result: Any, fallback: str) -> None:
+        """Close the job from the pipeline's result and record the document, so the link survives a restart."""
+        doc: Document | None = result.document
         doc_id = doc.id if doc is not None else None
-        if doc_id is not None:
-            self.jobs.set_doc(job_id, doc_id)
-        if doc is not None and doc.status == DocumentStatus.failed:
-            self._set_job(job_id, DocumentStatus.failed, doc.error or fallback, doc_id=doc_id)
+        outcome = {
+            "already_indexed": bool(result.already_indexed),
+            "replaced_doc_id": result.replaced_doc_id,
+            "replaced_title": result.replaced_title,
+        }
+        status = status_value(doc.status) if doc is not None else DocumentStatus.failed.value
+        if status == DocumentStatus.failed.value:
+            error = (doc.error if doc is not None else None) or fallback
+            self._update_job(item.job_id, DocumentStatus.failed, error, doc_id=doc_id, stage="failed", **outcome)
+        elif status == DocumentStatus.cancelled.value:
+            self._update_job(item.job_id, DocumentStatus.cancelled, None, doc_id=doc_id, stage="cancelled", **outcome)
         else:
-            self._set_job(job_id, DocumentStatus.ready, doc_id=doc_id)
+            chunks = doc.chunk_count if doc is not None else 0
+            self._update_job(item.job_id, DocumentStatus.ready, None, doc_id=doc_id, stage="done",
+                             chunks_done=chunks, chunks_total=chunks, eta_seconds=0, **outcome)
 
-    def _run_upload(self, job_id: str, collection_id: str, filename: str, data: bytes, title: str | None) -> None:
-        fallback = "The file could not be indexed."
-        self._set_job(job_id, DocumentStatus.processing)
-        try:
-            doc = self.pipeline.ingest_bytes(collection_id, data, filename, title=title)
-        except Exception as exc:
-            log.warning("ingestion failed", exc_info=True, extra={"job_id": job_id})
-            self._set_job(job_id, DocumentStatus.failed, plain_error(exc, fallback))
-            return
-        self._finish_from_document(job_id, doc, fallback)
+    def _end_cancelled(self, item: QueuedJob) -> None:
+        self._update_job(item.job_id, DocumentStatus.cancelled, None, stage="cancelled")
+        if item.kind == "retry":
+            self._restore_retry(item)
 
-    def _run_reindex(self, job_id: str, doc_id: str) -> None:
-        fallback = "The document could not be re-indexed."
-        self._set_job(job_id, DocumentStatus.processing)
+    def _abandon(self, item: QueuedJob, message: str) -> None:
+        """A job that will never run: it ends as failed with a plain reason."""
+        self._update_job(item.job_id, DocumentStatus.failed, message, stage="failed")
+        self._drop_spool(item)
+        if item.kind == "retry":
+            self._restore_retry(item)
+
+    def _restore_retry(self, item: QueuedJob) -> None:
+        """A retry that did not run puts the document back as it was: failed, with its error."""
         try:
-            doc = self.pipeline.reindex(doc_id)
-        except Exception as exc:
-            log.warning("re-index failed", exc_info=True, extra={"job_id": job_id})
-            self._set_job(job_id, DocumentStatus.failed, plain_error(exc, fallback))
+            doc = self.meta.get_document(item.doc_id)
+            if doc is not None and status_value(doc.status) in OPEN_STATUSES:
+                self.meta.update_document(doc.id, status=DocumentStatus.failed, error=item.previous_error)
+        except Exception:
+            log.warning("could not restore a document after a retry stopped", exc_info=True,
+                        extra={"doc_id": item.doc_id})
+
+    def cancel_job(self, job_id: str) -> JobOut:
+        """Cancel a waiting or running job. A finished job comes back unchanged.
+
+        A waiting job ends as cancelled at once. A running job is flagged; the pipeline stops at its
+        next checkpoint, keeps any previous version, and the worker records ``cancelled``.
+        """
+        meta = self.require("meta")
+        job = meta.get_job(job_id)
+        if job is None:
+            raise ApiError(404, "not_found", "Job not found.")
+        if status_value(job.status) not in OPEN_STATUSES:
+            return self.job_view(job)
+        try:
+            meta.request_cancel(job_id)
+        except Exception:
+            log.warning("could not flag a job for cancellation", exc_info=True, extra={"job_id": job_id})
+        where, item = self.scheduler.cancel(job_id)
+        if where == "queued" and item is not None:
+            self._end_cancelled(item)
+            self._drop_spool(item)
+        elif where == "idle":
+            # Not waiting or running here: left by a server that stopped, so nothing else will close it.
+            current = meta.get_job(job_id)
+            if current is not None and status_value(current.status) in OPEN_STATUSES:
+                self._update_job(job_id, DocumentStatus.cancelled, None, stage="cancelled")
+        self.audit("job_cancelled", collection_id=job.collection_id, job_id=job_id, state=where)
+        return self.get_job(job_id)
+
+    def _cancel_quietly(self, job_id: str) -> None:
+        try:
+            self.cancel_job(job_id)
+        except Exception:
+            log.warning("could not cancel a job before a delete", exc_info=True, extra={"job_id": job_id})
+
+    def recover_interrupted_jobs(self) -> int:
+        """At startup: jobs that a stopped server left queued or processing end as failed with a plain
+        reason, so do documents they left half-way, and spooled uploads nobody will read are removed."""
+        if self.meta is None:
+            return 0
+        recovered = 0
+        try:
+            collections = self.meta.list_collections()
+        except Exception:
+            log.warning("could not look for interrupted jobs", exc_info=True)
+            return 0
+        for collection in collections:
+            try:
+                jobs = self.meta.list_jobs(collection.id, limit=JOB_SCAN_LIMIT)
+            except Exception:
+                log.warning("could not list a collection's jobs", exc_info=True)
+                continue
+            for job in jobs:
+                if status_value(job.status) not in OPEN_STATUSES or self.scheduler.state(job.id) != "idle":
+                    continue
+                self._update_job(job.id, DocumentStatus.failed, INTERRUPTED_MESSAGE, stage="failed")
+                self._fail_stuck_document(job.doc_id)
+                recovered += 1
+        active = set(self.scheduler.active())
+        folder = self._spool_dir()
+        if folder.is_dir():
+            for path in folder.iterdir():
+                if path.is_file() and path.name not in active:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        log.warning("could not remove a stale spooled upload", exc_info=True)
+        if recovered:
+            log.warning("interrupted jobs closed as failed", extra={"jobs": recovered})
+        return recovered
+
+    def _fail_stuck_document(self, doc_id: str) -> None:
+        if not doc_id:
             return
-        self._finish_from_document(job_id, doc, fallback)
+        try:
+            doc = self.meta.get_document(doc_id)
+            if doc is None or status_value(doc.status) not in OPEN_STATUSES:
+                return
+            message = INTERRUPTED_MESSAGE
+            if doc.chunk_count:
+                message += " The previous version is still searchable."
+            self.meta.update_document(doc.id, status=DocumentStatus.failed, error=message)
+        except Exception:
+            log.warning("could not close a document left half-way", exc_info=True, extra={"doc_id": doc_id})
 
     # ------------------------------------------------------------------ search and answers
 
@@ -519,7 +867,8 @@ class Deps:
             answer = self._unavailable(question, collection_id, kv, unavailable, SEARCH_UNAVAILABLE)
         else:
             try:
-                hits = list(self.retriever.search(collection_id, question, k))
+                hits = list(self.retriever.search(collection_id, question, k,
+                                                  **compose_search_options(self.retriever, self.settings)))
             except RetrievalUnavailable:
                 log.warning("retrieval unavailable", extra={"collection_id": collection_id})
                 answer = self._unavailable(question, collection_id, kv, unavailable, SEARCH_UNAVAILABLE)
@@ -533,7 +882,9 @@ class Deps:
                                            "No answer provider is available in this installation.")
             else:
                 try:
-                    chosen = self.providers.select(requested)
+                    # A model the provider does not know is refused here, before any call, with a plain
+                    # message that names it and the models to choose from (status provider_unavailable).
+                    chosen = self.providers.select(requested, model=model)
                     provider_name = getattr(chosen, "name", provider_name)
                     answer = compose(question, hits, chosen, self.settings, collection_id=collection_id,
                                      knowledge_version=kv, has_documents=self.has_documents(collection_id),
@@ -579,6 +930,31 @@ class Deps:
             raise ApiError(404, "not_found", "Answer not found.")
         return Answer.model_validate_json(raw)
 
+    # ------------------------------------------------------------------ feedback
+
+    def add_feedback(self, answer_id: str, rating: str, note: str = "") -> Feedback:
+        meta = self.require("meta")
+        answer = self.get_answer(answer_id)
+        item = Feedback(id=uuid.uuid4().hex, answer_id=answer.id, collection_id=answer.collection_id,
+                        question=answer.question, rating=rating, note=note.strip(), created_at=utcnow())
+        meta.add_feedback(item)
+        self.audit("feedback", collection_id=answer.collection_id, answer_id=answer.id, rating=rating,
+                   has_note=bool(item.note))
+        return item
+
+    def list_feedback(self, collection_id: str, limit: int = 100) -> list[Feedback]:
+        """A collection's votes, newest first."""
+        meta = self.require("meta")
+        self.get_collection(collection_id)
+        return list(meta.list_feedback(collection_id, limit=limit))
+
+    def answer_feedback(self, answer_id: str) -> list[Feedback]:
+        """The votes on one answer, newest first."""
+        meta = self.require("meta")
+        answer = self.get_answer(answer_id)
+        return [f for f in meta.list_feedback(answer.collection_id, limit=FEEDBACK_SCAN_LIMIT)
+                if f.answer_id == answer.id]
+
     # ------------------------------------------------------------------ providers
 
     def provider_statuses(self, refresh: bool = False) -> list[ProviderStatus]:
@@ -592,11 +968,13 @@ class Deps:
     # ------------------------------------------------------------------ stats and health
 
     def collection_stats(self, collection_id: str) -> dict[str, Any]:
+        """Counts for one collection. The headline ``documents`` is the ready documents, and pages, size
+        and media types describe those; every status is in ``documents_by_status``."""
         meta = self.require("meta")
         collection = self.get_collection(collection_id)
         docs: list[Document] = meta.list_documents(collection_id)
-        by_status = Counter(status_value(d.status) for d in docs)
-        by_type = Counter(d.media_type for d in docs)
+        by_status = dict(Counter(status_value(d.status) for d in docs))
+        ready = [d for d in docs if status_value(d.status) == DocumentStatus.ready.value]
         chunks: int | None = None
         if self.store is not None:
             try:
@@ -609,24 +987,39 @@ class Deps:
         return {
             "collection_id": collection.id,
             "name": collection.name,
-            "documents": len(docs),
+            **headline(by_status),
+            "documents_ready": len(ready),
+            "by_status": dict(sorted(by_status.items())),  # the same as documents_by_status, for older clients
             "chunks": chunks,
-            "pages": sum(d.pages or 0 for d in docs),
-            "size_bytes": sum(d.size_bytes for d in docs),
-            "by_status": dict(by_status),
-            "by_media_type": dict(by_type),
+            "pages": sum(d.pages or 0 for d in ready),
+            "size_bytes": sum(d.size_bytes for d in ready),
+            "by_media_type": dict(Counter(d.media_type for d in ready)),
             "last_indexed_at": max(indexed).isoformat() if indexed else None,
             "knowledge_version": self.knowledge_version(),
         }
 
-    def health(self) -> dict[str, Any]:
+    def health(self, *, full: bool = True) -> dict[str, Any]:
+        """Status, version, counts and store health. ``full=False`` (a caller not on this machine) leaves
+        out everything local: the data folder, models, settings and supported types."""
         store_state = {"metadata": "unavailable", "vector": "unavailable"}
-        counts: dict[str, int | None] = {"collections": None, "documents": None, "chunks": None}
+        counts: dict[str, int | None] = dict.fromkeys(
+            ("collections", "documents", "documents_ready", "documents_failed", "documents_processing",
+             "documents_total", "chunks"))
         if self.meta is not None:
             try:
                 collections = self.meta.list_collections()
-                counts["collections"] = len(collections)
-                counts["documents"] = sum(len(self.meta.list_documents(c.id)) for c in collections)
+                by_status: Counter[str] = Counter()
+                for collection in collections:
+                    by_status.update(document_counts(self.meta, collection.id))
+                ready = by_status.get(DocumentStatus.ready.value, 0)
+                counts.update(
+                    collections=len(collections),
+                    documents=ready,
+                    documents_ready=ready,
+                    documents_failed=by_status.get(DocumentStatus.failed.value, 0),
+                    documents_processing=sum(by_status.get(s, 0) for s in IN_PROGRESS),
+                    documents_total=sum(by_status.values()),
+                )
                 store_state["metadata"] = "ok"
             except Exception:
                 log.warning("metadata store health check failed", exc_info=True)
@@ -637,7 +1030,7 @@ class Deps:
             except Exception:
                 log.warning("vector store health check failed", exc_info=True)
         ok = all(v == "ok" for v in store_state.values()) and not self.problems
-        return {
+        payload: dict[str, Any] = {
             "status": "ok" if ok else "degraded",
             "version": __version__,
             "knowledge_version": self.knowledge_version(),
@@ -668,6 +1061,9 @@ class Deps:
                 "tools": list(MCP_TOOLS) if self.mcp_mounted else [],
             },
         }
+        if not full:
+            return {**{key: payload[key] for key in PUBLIC_HEALTH_KEYS}, "view": "public"}
+        return {**payload, "view": "full"}
 
 
 def _try_build(problems: dict[str, str], label: str, factory: Any, *args: Any, **kwargs: Any) -> Any:
@@ -713,8 +1109,9 @@ def build_deps(settings: Settings | None = None, *, fake_embedder: bool | None =
 
     retriever = None
     if Retriever is not None and store is not None and embedder is not None:
-        retriever = _try_build(problems, "retriever", Retriever, store, embedder, reranker=reranker,
-                               min_score=settings.MIN_SCORE)
+        # MIN_SCORE, CANDIDATES and NEIGHBOUR_EXPANSION come from the settings.
+        retriever = _try_build(problems, "retriever", Retriever.from_settings, store, embedder, settings,
+                               reranker=reranker)
 
     pipeline = None
     if IngestPipeline is not None and meta is not None and store is not None and embedder is not None:
@@ -755,3 +1152,14 @@ def supported_media_type(filename: str) -> str | None:
 
 def supported_types() -> list[str]:
     return sorted(SUPPORTED_SUFFIXES)
+
+
+def encrypted_reason(filename: str, data: bytes) -> str | None:
+    """The plain reason a password-protected PDF, Word or Excel upload is refused, or None."""
+    if check_data_not_encrypted is None:
+        return None
+    try:
+        check_data_not_encrypted(data, supported_media_type(filename))
+    except EncryptedFileError as exc:
+        return str(getattr(exc, "message", "") or exc)
+    return None

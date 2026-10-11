@@ -36,6 +36,8 @@ _RESERVED_LOG_KEYS = set(vars(logging.LogRecord("", 0, "", 0, "", None, None))) 
 _UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 _QUIET_PATHS = {"/api/health"}
 _HEALTH_PATHS = {"/api/health", "/api/health/"}
+# The API description and its viewers describe every route, so they follow the API's loopback rule.
+_SCHEMA_PATHS = {"/openapi.json", "/docs", "/redoc"}
 API_LOCAL_ONLY_MESSAGE = (
     "The API only answers on this machine (localhost). To reach it from elsewhere, set "
     "RAGKB_API_PUBLIC=true and put it behind your own sign-in."
@@ -96,9 +98,10 @@ class RequestMiddleware:
     """Logs every request with its status and time, keeps the API on this machine, and refuses
     cross-site writes to the API.
 
-    Unless ``api_public`` is set (``RAGKB_API_PUBLIC=true``), a request to ``/api`` whose Host is not
-    loopback gets 403: a tunnel opened for an assistant to reach ``/mcp`` must not expose the API,
-    which has no sign-in. ``GET /api/health`` stays open for monitoring.
+    Unless ``api_public`` is set (``RAGKB_API_PUBLIC=true``), a request to ``/api`` (or to the API
+    description at ``/openapi.json``, ``/docs`` and ``/redoc``) whose Host is not loopback gets 403: a
+    tunnel opened for an assistant to reach ``/mcp`` must not expose the API, which has no sign-in.
+    ``GET /api/health`` stays open for monitoring, without anything local in it.
 
     A browser always sends ``Origin`` on a cross-site POST or DELETE, so a page on another site cannot
     upload, ask or delete through a user's local server. Same-origin calls and non-browser clients
@@ -116,8 +119,9 @@ class RequestMiddleware:
         method = scope.get("method", "GET")
         path = scope.get("path", "")
         is_api = path == "/api" or path.startswith("/api/")
+        guarded = is_api or path in _SCHEMA_PATHS or path.startswith("/docs/")
         health = method == "GET" and path in _HEALTH_PATHS
-        if is_api and not self.api_public and not health and not host_is_loopback(_header(scope, b"host")):
+        if guarded and not self.api_public and not health and not host_is_loopback(_header(scope, b"host")):
             log.warning("non-local API request refused", extra={"method": method, "path": path})
             response = error_response(403, "forbidden", API_LOCAL_ONLY_MESSAGE)
             await response(scope, receive, send)
@@ -149,6 +153,10 @@ class RequestMiddleware:
 def _lifespan_factory(deps: Deps) -> Callable[[FastAPI], Any]:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        try:
+            deps.recover_interrupted_jobs()
+        except Exception:
+            log.warning("could not close interrupted jobs", exc_info=True)
         log.info("rag-kb started", extra={"version": __version__, "status": deps.health()["status"]})
         async with AsyncExitStack() as stack:
             # Parts that mount sub-apps needing startup work (for example the MCP session manager) can

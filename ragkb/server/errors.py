@@ -96,18 +96,46 @@ def plain_error(exc: BaseException, fallback: str, *, limit: int = 300) -> str:
     return message or fallback
 
 
-def _validation_message(errors: list[dict[str, Any]]) -> str:
+# Errors about the body as a whole: not an object, absent, or the wrong kind of value.
+_WHOLE_BODY_TYPES = {"model_attributes_type", "dict_type", "model_type", "missing", "json_type"}
+
+
+def body_fields(request: Request) -> list[str]:
+    """The fields of the route's JSON body, required ones marked, or an empty list for other routes."""
+    route = request.scope.get("route")
+    params = list(getattr(getattr(route, "dependant", None), "body_params", None) or [])
+    if len(params) != 1:
+        return []
+    fields = getattr(getattr(params[0].field_info, "annotation", None), "model_fields", None)
+    if not isinstance(fields, dict):
+        return []
+    return [f"{name} (required)" if info.is_required() else name for name, info in fields.items()]
+
+
+def _body_shape(fields: list[str], *, lead: str = "The request body must") -> str:
+    if fields:
+        return f"{lead} be a JSON object with these fields: {', '.join(fields)}."
+    return f"{lead} be a JSON object."
+
+
+def _validation_message(errors: list[dict[str, Any]], fields: list[str] | None = None) -> str:
+    """One plain sentence for the first validation error, never the validator's own wording for a
+    malformed body."""
+    fields = fields or []
     if not errors:
         return _MESSAGE_BY_STATUS[422]
     first = errors[0]
     kind = str(first.get("type", ""))
-    if kind in {"json_invalid", "json_type"}:
-        return "The request body is not valid JSON."
-    loc = [str(part) for part in first.get("loc", ()) if part not in ("body", "query", "path", "form", "header")]
+    raw_loc = tuple(first.get("loc", ()))
+    if kind == "json_invalid":
+        return "The request body is not valid JSON. " + _body_shape(fields, lead="It must")
+    if raw_loc == ("body",) and kind in _WHOLE_BODY_TYPES:
+        return _body_shape(fields)
+    loc = [str(part) for part in raw_loc if part not in ("body", "query", "path", "form", "header")]
     field = ".".join(loc)
     if kind == "missing":
         return f"{field} is required." if field else "A required value is missing."
-    msg = str(first.get("msg", "is not valid")).rstrip(".")
+    msg = str(first.get("msg", "is not valid")).removeprefix("Value error, ").rstrip(".")
     msg = strip_paths(msg)
     return f"{field}: {msg}." if field else f"{msg}."
 
@@ -129,8 +157,8 @@ async def _http_exception_handler(_request: Request, exc: StarletteHTTPException
     return error_response(status, code, message, headers=getattr(exc, "headers", None))
 
 
-async def _validation_exception_handler(_request: Request, exc: RequestValidationError) -> JSONResponse:
-    return error_response(422, "invalid_request", _validation_message(list(exc.errors())))
+async def _validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return error_response(422, "invalid_request", _validation_message(list(exc.errors()), body_fields(request)))
 
 
 async def _unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
